@@ -1,15 +1,10 @@
 @echo off
 echo =====================================
-echo Running tests before commit...
+echo Committing and pushing all changes
 echo =====================================
 
-
-
-echo.
-echo ✅ Tests passed. Proceeding to commit...
-echo.
-
-set /p msg="Enter commit message: "
+REM Set default commit message
+set "msg=Auto commit"
 
 git add .
 
