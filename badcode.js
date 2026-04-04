@@ -1,9 +1,9 @@
 // badCode.js — intentionally messy / risky
 
 // Security risks
-// const password = '123456'; // hardcoded password
-// const apiKey = 'ABCDEF123456'; // exposed API key
-// eval("console.log('this is dangerous')"); // eval usage
+const password = '123456'; // hardcoded password
+const apiKey = 'ABCDEF123456'; // exposed API key
+eval("console.log('this is dangerous')"); // eval usage
 
 Errors & reliability;
 async function riskyFunction() {
