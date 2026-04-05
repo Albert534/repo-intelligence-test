@@ -19,24 +19,24 @@ function(badName) {
 const bad_array = [1, 2, "three", { help: "me" }];
 bad_array = 10; // Assigning a number to a constant array
 
-// 5. Syntax nightmares
-for (i = 0; i > 10; i--) { 
-    // This is an infinite loop that goes the wrong way
-    document.write(i ++++++++++ "broken"); 
-}
+// // 5. Syntax nightmares
+// for (i = 0; i > 10; i--) { 
+//     // This is an infinite loop that goes the wrong way
+//     document.write(i ++++++++++ "broken"); 
+// }
 
-// 6. Asynchronous nonsense
-await function not_async() {
-    yield "Wait, this isn't a generator";
-}();
+// // 6. Asynchronous nonsense
+// await function not_async() {
+//     yield "Wait, this isn't a generator";
+// }();
 
-// 7. HTML in my JS? It's more likely than you think.
-<div>
-    <p>This is just straight up HTML in a .js file</p>
-</div>
+// // 7. HTML in my JS? It's more likely than you think.
+// <div>
+//     <p>This is just straight up HTML in a .js file</p>
+// </div>
 
-// 8. Closing brackets? Never heard of 'em
-{
- {
-  {
-   console.log("Goodbye, compiler");
+// // 8. Closing brackets? Never heard of 'em
+// {
+//  {
+//   {
+//    console.log("Goodbye, compiler");
