@@ -9,6 +9,10 @@ echo.
 echo ✅ Tests passed. Proceeding to commit...
 echo.
 
+// ❌ What you wrote:
+set /p msg="Enter commit message: "
+
+// ✅ Use strict equality:
 set /p msg="Enter commit message: "
 
 git add .
