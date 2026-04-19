@@ -1,28 +1,60 @@
 // 1. Using reserved words as variables and forgetting how math works
+// ❌ What you wrote:
 var default = "error";
+
+// ✅ Fix:
+let default = "error";
+// ⚠️ '567_numbers' might be unused
+// ❌ What you wrote:
 let 567_numbers = true;
+
+// ✅ Remove it if not needed
 
 // 2. Breaking the laws of physics/boolean logic
 if (false == true) {
-    console.log("I am a genius");
+    ❌ What you wrote:
+console.log("I am a genius");
+
+✅ Fix:
+console?.log("I am a genius");
 } else {
-    throw "This string is somehow an error object now";
+    ❌ What you wrote:
+throw "This string is somehow an error object now";
+
+✅ Fix:
+throw new Error("This string is somehow an error object now");
 }
 
 // 3. Functions that don't function
 function(badName) {
     return ; ; ; ;
-    console.log("This will never run, but neither will the function");
+    ❌ What you wrote:
+console.log("This will never run, but neither will the function");
+
+✅ Fix:
+console?.log("This will never run, but neither will the function");
 }
 
 // // 4. Mixing types like a chaotic blender
+// ⚠️ 'bad_array' might be unused
+// ❌ What you wrote:
 const bad_array = [1, 2, "three", { help: "me" }];
+
+// ✅ Remove it if not needed
 bad_array = 10; // Assigning a number to a constant array
 
 // 5. Syntax nightmares
+// ❌ What you wrote:
 for (i = 0; i > 10; i--) {
+
+// ✅ Extract to a named constant:
+const MEANINGFUL_NAME = 10; // explain what this value represents
     // This is an infinite loop that goes the wrong way
-    document.write(i ++++++++++ "broken");
+    ❌ What you wrote:
+document.write(i ++++++++++ "broken");
+
+✅ Fix:
+document?.write(i ++++++++++ "broken");
 }
 
 // // 6. Asynchronous nonsense
@@ -39,4 +71,8 @@ for (i = 0; i > 10; i--) {
 // {
 //  {
 //   {
+❌ What you wrote:
 //    console.log("Goodbye, compiler");
+
+✅ Fix:
+//    console?.log("Goodbye, compiler");
