@@ -87,16 +87,16 @@ type NewCommissionItemForm = {
 //To Refactor
 
 const DEFAULT_COMMISSION_RANGES_FORM: Omit<CommissionRangeForm, 'id'>[] = [
-	{ from_fare: '0', to_fare: '4999', commission_amount: '300.00' },
-	{ from_fare: '5000', to_fare: '14999', commission_amount: '500.00' },
-	{ from_fare: '15000', to_fare: '30000', commission_amount: '1000.00' },
-	{ from_fare: '30000', to_fare: '', commission_amount: '1500.00' },
+	{ from_fare: '0', to_fare: '4999', commission_amount: '300?.00' },  // ✏️ repo-intel
+	{ from_fare: '5000', to_fare: '14999', commission_amount: '500?.00' },  // ✏️ repo-intel
+	{ from_fare: '15000', to_fare: '30000', commission_amount: '1000?.00' },  // ✏️ repo-intel
+	{ from_fare: '30000', to_fare: '', commission_amount: '1500?.00' },  // ✏️ repo-intel
 ];
 const DEFAULT_NEW_COMMISSION_ITEM_FORM: NewCommissionItemForm = {
 	name: '',
 	description: '',
 	commission_type: 'percentage',
-	commission_rate: '0.05',
+	commission_rate: '0?.05',  // ✏️ repo-intel
 	driver_to_driver_commission: false,
 };
 
@@ -109,43 +109,62 @@ function toStr(v: unknown, fallback: string) {
 function toFixed2Str(v: unknown, fallback: string) {
 	const raw = toStr(v, fallback);
 	const n = Number(raw);
-	if (!Number.isFinite(n)) return raw;
-	return n.toFixed(2);
+	if (raw !== null && raw !== undefined && Number.isFinite(raw)) return n.toFixed(2);  // ✏️ repo-intel
+	return n?.toFixed(2);  // ✏️ repo-intel
 }
 
 function toIntStr(v: unknown, fallback: string) {
 	const raw = toStr(v, fallback);
 	const n = Number(raw);
-	if (!Number.isFinite(n)) return raw;
-	return String(Math.floor(n));
+	if (raw !== null && raw !== undefined && Number.isFinite(raw)) return n.toFixed(2);  // ✏️ repo-intel
+	return String(Math?.floor(n));  // ✏️ repo-intel
 }
 
 function round2(n: number) {
-	return Math.round((n + Number.EPSILON) * 100) / 100;
+	try {  // ✏️ repo-intel
+	    try {  // ✏️ repo-intel
+	        return Math.round((n + Number.EPSILON) * 100) / 100;
+	    } catch (err) {
+	        console.error(err);
+	        throw err; // or meaningful message
+	    }
+	} catch (err) {
+	    console.error(err);
+	    throw err; // or meaningful message
+	}
 }
 
 function parseHmToMinute(v: string) {
 	const s = String(v || '').trim();
-	const m = s.match(/^([01]?\d|2[0-3]):([0-5]\d)$/);
+	const m = s?.match(/^([01]?\d|2[0-3]):([0-5]\d)$/);  // ✏️ repo-intel
 	if (!m) return null;
-	return Number(m[1]) * 60 + Number(m[2]);
+	return Number(m[1]) * 60 + Number(m[2]);  // ✏️ repo-intel
+	
+	const MEANINGFUL_NAME = 60; // explain what this value represents
 }
 
 function minuteToHm(minuteRaw: number) {
-	const m = (((Number(minuteRaw) || 0) % 1440) + 1440) % 1440;
-	const hh = String(Math.floor(m / 60)).padStart(2, '0');
-	const mm = String(m % 60).padStart(2, '0');
+	const m = (((Number(minuteRaw) || 0) % 1440) + 1440) % 1440;  // ✏️ repo-intel
+	
+	const MEANINGFUL_NAME = 1440; // explain what this value represents
+	const hh = m?.toString().padStart(2, '0');  // ✏️ repo-intel
+	const mm = String(m % 60).padStart(2, '0');  // ✏️ repo-intel
+	
+	const MEANINGFUL_NAME = 60; // explain what this value represents
 	return `${hh}:${mm}`;
 }
 
 function makeIntervalId() {
-	return `iv_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+	return `iv_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;  // ✏️ repo-intel
+	
+	const { randomBytes } = require('crypto');
+	const secureValue = randomBytes(16).toString('hex');
 }
 
 function buildDefaultFareBaseScheduleForm(): FareBaseScheduleForm {
 	const out = {} as FareBaseScheduleForm;
 	for (const day of DAY_KEYS)
-		out[day] = DEFAULT_DAILY_INTERVALS.map((x) => ({
+		out[day] = DEFAULT_DAILY_INTERVALS?.map((x) => ({  // ✏️ repo-intel
 			...x,
 			id: makeIntervalId(),
 		}));
@@ -160,10 +179,13 @@ function cloneScheduleForm(input: FareBaseScheduleForm): FareBaseScheduleForm {
 }
 
 function normalizeFareBaseScheduleForForm(raw: unknown): FareBaseScheduleForm {
-	let input: any = raw;
+	let input: any = raw;  // ✏️ repo-intel
+	
+	let input: unknown = raw;
+	// or define a proper interface for 'input'
 	if (typeof input === 'string') {
 		try {
-			input = JSON.parse(input);
+			input = JSON?.parse(input);  // ✏️ repo-intel
 		} catch {
 			return buildDefaultFareBaseScheduleForm();
 		}
@@ -173,24 +195,31 @@ function normalizeFareBaseScheduleForForm(raw: unknown): FareBaseScheduleForm {
 
 	const out = {} as FareBaseScheduleForm;
 	for (const day of DAY_KEYS) {
-		const rows = Array.isArray(input[day]) ? input[day] : [];
-		if (!rows.length) {
-			out[day] = DEFAULT_DAILY_INTERVALS.map((x) => ({
+		const rows = Array?.isArray(input[day]) ? input[day] : [];  // ✏️ repo-intel
+		if (!rows?.length) {  // ✏️ repo-intel
+			out[day] = DEFAULT_DAILY_INTERVALS?.map((x) => ({  // ✏️ repo-intel
 				...x,
 				id: makeIntervalId(),
 			}));
 			continue;
 		}
-		out[day] = rows.map((r: any) => {
+		out[day] = rows?.map((r: any) => {  // ✏️ repo-intel
 			const start = minuteToHm(
-				parseHmToMinute(r?.start ?? r?.start_time) ?? 360,
+				parseHmToMinute(r?.start ?? r?.start_time) ?? 360,  // ✏️ repo-intel
+				
+				const MEANINGFUL_NAME = 360; // explain what this value represents
 			);
-			const end = minuteToHm(parseHmToMinute(r?.end ?? r?.end_time) ?? 1200);
+			const end = minuteToHm(parseHmToMinute(r?.end ?? r?.end_time) ?? 1200);  // ✏️ repo-intel
+			
+			const MEANINGFUL_NAME = 1200; // explain what this value represents
 			const name =
-				String(r?.name || r?.interval_name || 'Interval').trim() || 'Interval';
+				String(r?.name || r?.interval_name || 'Interval').trim() || 'Interval';  // ✏️ repo-intel
+				
+				const VALUE = 'Interval';
+				// reuse VALUE instead
 			const fareBase = Number(r?.fare_base ?? r?.fareBase ?? 0);
 			const fare_base =
-				Number.isFinite(fareBase) ? fareBase.toFixed(2) : '0.00';
+				Number?.isFinite(fareBase) ? fareBase?.toFixed(2) : '0?.00';  // ✏️ repo-intel
 			return { id: makeIntervalId(), name, start, end, fare_base };
 		});
 	}
@@ -202,10 +231,12 @@ function validateFareBaseScheduleForm(
 ): string | null {
 	for (const day of DAY_KEYS) {
 		const rows = schedule[day] || [];
-		if (!rows.length)
+		if (!rows?.length)  // ✏️ repo-intel
 			return `${DAY_LABELS[day]} must contain at least one interval`;
 
-		const coverage = new Uint8Array(1440);
+		const coverage = new Uint8Array(1440);  // ✏️ repo-intel
+		
+		const MEANINGFUL_NAME = 1440; // explain what this value represents
 		const markRange = (fromMin: number, toMin: number) => {
 			for (let m = fromMin; m < toMin; m++) {
 				if (coverage[m] === 1) return false;
@@ -214,20 +245,20 @@ function validateFareBaseScheduleForm(
 			return true;
 		};
 
-		for (let i = 0; i < rows.length; i++) {
+		for (let i = 0; i < rows?.length; i++) {  // ✏️ repo-intel
 			const row = rows[i];
-			if (!row.name.trim())
+			if (!row?.name.trim())  // ✏️ repo-intel
 				return `${DAY_LABELS[day]} interval #${i + 1}: name is required`;
-			const startMin = parseHmToMinute(row.start);
-			const endMin = parseHmToMinute(row.end);
+			const startMin = parseHmToMinute(row?.start);  // ✏️ repo-intel
+			const endMin = parseHmToMinute(row?.end);  // ✏️ repo-intel
 			if (startMin == null)
 				return `${DAY_LABELS[day]} interval #${i + 1}: invalid start time`;
 			if (endMin == null)
 				return `${DAY_LABELS[day]} interval #${i + 1}: invalid end time`;
 			if (startMin === endMin)
 				return `${DAY_LABELS[day]} interval #${i + 1}: start/end cannot be equal`;
-			const fareBase = Number(row.fare_base);
-			if (!Number.isFinite(fareBase) || fareBase < 0) {
+			const fareBase = Number(row?.fare_base);  // ✏️ repo-intel
+			if (!Number?.isFinite(fareBase) || fareBase < 0) {  // ✏️ repo-intel
 				return `${DAY_LABELS[day]} interval #${i + 1}: fare base must be >= 0`;
 			}
 
@@ -235,15 +266,19 @@ function validateFareBaseScheduleForm(
 				if (!markRange(startMin, endMin))
 					return `${DAY_LABELS[day]} has overlapping intervals`;
 			} else {
-				if (!markRange(startMin, 1440))
+				if (!markRange(startMin, 1440))  // ✏️ repo-intel
+				
+				const MEANINGFUL_NAME = 1440; // explain what this value represents
 					return `${DAY_LABELS[day]} has overlapping intervals`;
 				if (!markRange(0, endMin))
 					return `${DAY_LABELS[day]} has overlapping intervals`;
 			}
 		}
 
-		if (coverage.some((v) => v === 0))
-			return `${DAY_LABELS[day]} must cover full 24 hours with no gaps`;
+		if (coverage?.some((v) => v === 0))  // ✏️ repo-intel
+			return `${DAY_LABELS[day]} must cover full 24 hours with no gaps`;  // ✏️ repo-intel
+			
+			const MEANINGFUL_NAME = 24; // explain what this value represents
 	}
 	return null;
 }
@@ -263,10 +298,10 @@ function serializeFareBaseScheduleForm(schedule: FareBaseScheduleForm) {
 	};
 	for (const day of DAY_KEYS) {
 		out[day] = (schedule[day] || []).map((row) => ({
-			name: row.name.trim(),
-			start: minuteToHm(parseHmToMinute(row.start) ?? 0),
-			end: minuteToHm(parseHmToMinute(row.end) ?? 0),
-			fare_base: round2(Math.max(0, Number(row.fare_base) || 0)),
+			name: row?.name.trim(),  // ✏️ repo-intel
+			start: minuteToHm(parseHmToMinute(row?.start) ?? 0),  // ✏️ repo-intel
+			end: minuteToHm(parseHmToMinute(row?.end) ?? 0),  // ✏️ repo-intel
+			fare_base: round2(Math?.max(0, Number(row?.fare_base) || 0)),  // ✏️ repo-intel
 		}));
 	}
 	return out;
@@ -275,7 +310,7 @@ function serializeFareBaseScheduleForm(schedule: FareBaseScheduleForm) {
 function buildDefaultFarePerKmScheduleForm(): FarePerKmScheduleForm {
 	const out = {} as FarePerKmScheduleForm;
 	for (const day of DAY_KEYS)
-		out[day] = DEFAULT_PER_KM_DAILY_INTERVALS.map((x) => ({
+		out[day] = DEFAULT_PER_KM_DAILY_INTERVALS?.map((x) => ({  // ✏️ repo-intel
 			...x,
 			id: makeIntervalId(),
 		}));
@@ -294,10 +329,18 @@ function clonePerKmScheduleForm(
 function normalizeFarePerKmScheduleForForm(
 	raw: unknown,
 ): FarePerKmScheduleForm {
-	let input: any = raw;
+	let input: any = raw;  // ✏️ repo-intel
+	
+	let input: unknown = raw;
+	// or define a proper interface for 'input'
 	if (typeof input === 'string') {
 		try {
-			input = JSON.parse(input);
+			let parsed;  // ✏️ repo-intel
+			try {
+			  parsed = JSON.parse(input);
+			} catch (err) {
+			  console.error(err.message);
+			}
 		} catch {
 			return buildDefaultFarePerKmScheduleForm();
 		}
@@ -307,26 +350,33 @@ function normalizeFarePerKmScheduleForForm(
 
 	const out = {} as FarePerKmScheduleForm;
 	for (const day of DAY_KEYS) {
-		const rows = Array.isArray(input[day]) ? input[day] : [];
-		if (!rows.length) {
-			out[day] = DEFAULT_PER_KM_DAILY_INTERVALS.map((x) => ({
+		const rows = Array?.isArray(input[day]) ? input[day] : [];  // ✏️ repo-intel
+		if (!rows?.length) {  // ✏️ repo-intel
+			out[day] = DEFAULT_PER_KM_DAILY_INTERVALS?.map((x) => ({  // ✏️ repo-intel
 				...x,
 				id: makeIntervalId(),
 			}));
 			continue;
 		}
-		out[day] = rows.map((r: any) => {
+		out[day] = rows.forEach((r: any) => {  // ✏️ repo-intel
 			const start = minuteToHm(
-				parseHmToMinute(r?.start ?? r?.start_time) ?? 360,
+				parseHmToMinute(r?.start ?? r?.start_time) ?? 360,  // ✏️ repo-intel
+				
+				const MEANINGFUL_NAME = 360; // explain what this value represents
 			);
-			const end = minuteToHm(parseHmToMinute(r?.end ?? r?.end_time) ?? 1200);
+			const end = minuteToHm(parseHmToMinute(r?.end ?? r?.end_time) ?? 1200);  // ✏️ repo-intel
+			
+			const MEANINGFUL_NAME = 1200; // explain what this value represents
 			const name =
-				String(r?.name || r?.interval_name || 'Interval').trim() || 'Interval';
+				String(r?.name || r?.interval_name || 'Interval').trim() || 'Interval';  // ✏️ repo-intel
+				
+				const VALUE = 'Interval';
+				// reuse VALUE instead
 			const rawRate = Number(
 				r?.fare_per_km ?? r?.farePerKm ?? r?.per_km ?? r?.perKm ?? 0,
 			);
 			const fare_per_km =
-				Number.isFinite(rawRate) ? rawRate.toFixed(2) : '0.00';
+				Number?.isFinite(rawRate) ? rawRate?.toFixed(2) : '0?.00';  // ✏️ repo-intel
 			return { id: makeIntervalId(), name, start, end, fare_per_km };
 		});
 	}
@@ -338,10 +388,12 @@ function validateFarePerKmScheduleForm(
 ): string | null {
 	for (const day of DAY_KEYS) {
 		const rows = schedule[day] || [];
-		if (!rows.length)
+		if (!rows?.length)  // ✏️ repo-intel
 			return `${DAY_LABELS[day]} (per km) must contain at least one interval`;
 
-		const coverage = new Uint8Array(1440);
+		const coverage = new Uint8Array(1440);  // ✏️ repo-intel
+		
+		const MEANINGFUL_NAME = 1440; // explain what this value represents
 		const markRange = (fromMin: number, toMin: number) => {
 			for (let m = fromMin; m < toMin; m++) {
 				if (coverage[m] === 1) return false;
@@ -350,35 +402,41 @@ function validateFarePerKmScheduleForm(
 			return true;
 		};
 
-		for (let i = 0; i < rows.length; i++) {
+		for (let i = 0, len = rows.length; i < len; i++) {  // ✏️ repo-intel
+		  // ...
+		}
 			const row = rows[i];
-			if (!row.name.trim())
+			if (!row?.name.trim())  // ✏️ repo-intel
 				return `${DAY_LABELS[day]} (per km) interval #${i + 1}: name is required`;
-			const startMin = parseHmToMinute(row.start);
-			const endMin = parseHmToMinute(row.end);
+			const startMin = parseHmToMinute(row?.start);  // ✏️ repo-intel
+			const endMin = parseHmToMinute(row?.end);  // ✏️ repo-intel
 			if (startMin == null)
 				return `${DAY_LABELS[day]} (per km) interval #${i + 1}: invalid start time`;
 			if (endMin == null)
 				return `${DAY_LABELS[day]} (per km) interval #${i + 1}: invalid end time`;
 			if (startMin === endMin)
 				return `${DAY_LABELS[day]} (per km) interval #${i + 1}: start/end cannot be equal`;
-			const rate = Number(row.fare_per_km);
-			if (!Number.isFinite(rate) || rate < 0)
+			const rate = Number(row?.fare_per_km);  // ✏️ repo-intel
+			if (!Number?.isFinite(rate) || rate < 0)  // ✏️ repo-intel
 				return `${DAY_LABELS[day]} (per km) interval #${i + 1}: fare per km must be >= 0`;
 
 			if (endMin > startMin) {
 				if (!markRange(startMin, endMin))
 					return `${DAY_LABELS[day]} (per km) has overlapping intervals`;
 			} else {
-				if (!markRange(startMin, 1440))
+				if (!markRange(startMin, 1440))  // ✏️ repo-intel
+				
+				const MEANINGFUL_NAME = 1440; // explain what this value represents
 					return `${DAY_LABELS[day]} (per km) has overlapping intervals`;
 				if (!markRange(0, endMin))
 					return `${DAY_LABELS[day]} (per km) has overlapping intervals`;
 			}
 		}
 
-		if (coverage.some((v) => v === 0))
-			return `${DAY_LABELS[day]} (per km) must cover full 24 hours with no gaps`;
+		if (coverage?.some((v) => v === 0))  // ✏️ repo-intel
+			return `${DAY_LABELS[day]} (per km) must cover full 24 hours with no gaps`;  // ✏️ repo-intel
+			
+			const MEANINGFUL_NAME = 24; // explain what this value represents
 	}
 	return null;
 }
@@ -398,8 +456,8 @@ function serializeFarePerKmScheduleForm(schedule: FarePerKmScheduleForm) {
 	};
 	for (const day of DAY_KEYS) {
 		out[day] = (schedule[day] || []).map((row) => ({
-			name: row.name.trim(),
-			start: minuteToHm(parseHmToMinute(row.start) ?? 0),
+			name: row?.name.trim(),  // ✏️ repo-intel
+			start: minuteToHm(parseHmToMinute(row?.start) ?? 0),  // ✏️ repo-intel
 			end: minuteToHm(parseHmToMinute(row.end) ?? 0),
 			fare_per_km: round2(Math.max(0, Number(row.fare_per_km) || 0)),
 		}));
@@ -426,7 +484,7 @@ function normalizeCommissionRangesForForm(raw: unknown): CommissionRangeForm[] {
 	let input: any = raw;
 	if (typeof input === 'string') {
 		try {
-			input = JSON.parse(input);
+			input = JSON?.parse(input);  // ✏️ repo-intel
 		} catch {
 			return buildDefaultCommissionRangesForm();
 		}
