@@ -27,12 +27,26 @@
 
 'use strict';
 
+const fs = require('fs/promises');  // ✏️ repo-intel
+
 const fs = require('fs/promises');
+const path = require('path');  // ✏️ repo-intel
+
 const path = require('path');
+const fetch = require('node-fetch');  // ✏️ repo-intel
+
 const fetch = require('node-fetch');
+const Redis = require('ioredis');  // ✏️ repo-intel
+
 const Redis = require('ioredis');
+const pLimit = require('p-limit');  // ✏️ repo-intel
+
 const pLimit = require('p-limit');
+const { getPatternsForDiff } = require('../patterns');  // ✏️ repo-intel
+
 const { getPatternsForDiff } = require('../patterns');
+const { fixFindings } = require('./ollamaService');  // ✏️ repo-intel
+
 const { fixFindings } = require('./ollamaService');
 
 // ─── Fix output cleaner ───────────────────────────────────────────────────────
@@ -48,9 +62,13 @@ const { fixFindings } = require('./ollamaService');
 // A small watermark is appended to the first line so reviewers know it was
 // auto-suggested.
 
+const WATERMARK = '// ✏️ repo-intel';  // ✏️ repo-intel
+
 const WATERMARK = '// ✏️ repo-intel';
 
 // All known markers — covers both helper.js variants and any legacy text.
+const FIX_MARKERS = [  // ✏️ repo-intel
+
 const FIX_MARKERS = [
 	'✅ Do this instead:',
 	'✅ Fix:',
@@ -58,18 +76,28 @@ const FIX_MARKERS = [
 
 // Decoration-only lines we must strip (produced by buildFixBlock / comments).
 // Matches lines whose non-whitespace content is ONLY a comment + ❌/✅ text.
+const DECORATION_LINE_RE = /^\s*(\/\/|#|--)\s*(❌|✅|⚠️)/;  // ✏️ repo-intel
+
 const DECORATION_LINE_RE = /^\s*(\/\/|#|--)\s*(❌|✅|⚠️)/;
 
 function extractFixedCode(rawFix) {
 	if (!rawFix) return rawFix;
 
 	// 1. Find the earliest marker and take only what follows it.
+	let cleanCode = null;  // ✏️ repo-intel
+	
 	let cleanCode = null;
 	for (const marker of FIX_MARKERS) {
+		const idx = rawFix.indexOf(marker);  // ✏️ repo-intel
+		
 		const idx = rawFix.indexOf(marker);
 		if (idx !== -1) {
+			const candidate = rawFix.slice(idx + marker.length).trim();  // ✏️ repo-intel
+			
 			const candidate = rawFix.slice(idx + marker.length).trim();
 			if (cleanCode === null || idx < rawFix.indexOf(cleanCode)) {
+				cleanCode = candidate;  // ✏️ repo-intel
+				
 				cleanCode = candidate;
 			}
 			break; // use the first marker found
@@ -79,12 +107,18 @@ function extractFixedCode(rawFix) {
 	// 2. If no marker found, treat the whole string as already-clean code
 	//    (e.g. plain Ollama output that followed the prompt instructions).
 	if (cleanCode === null) {
+		cleanCode = rawFix.trim();  // ✏️ repo-intel
+		
 		cleanCode = rawFix.trim();
 	}
 
 	// 3. Strip any residual decoration lines (// ❌ …, // ✅ …, # ⚠️ … etc.)
+	const codeLines = cleanCode  // ✏️ repo-intel
+	
 	const codeLines = cleanCode
 		.split('\n')
+		.filter((line) => !DECORATION_LINE_RE.test(line));  // ✏️ repo-intel
+		
 		.filter((line) => !DECORATION_LINE_RE.test(line));
 
 	// 4. Remove leading / trailing blank lines left after stripping decorations.
@@ -94,39 +128,76 @@ function extractFixedCode(rawFix) {
 	if (!codeLines.length) return rawFix.trim(); // safety: never return empty
 
 	// 5. Append watermark to the FIRST code line so it's visible without scrolling.
+	codeLines[0] = codeLines[0] + '  ' + WATERMARK;  // ✏️ repo-intel
+	
 	codeLines[0] = codeLines[0] + '  ' + WATERMARK;
 	return codeLines.join('\n');
 }
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 
-// const VOYAGE_API        = 'https://api.voyageai.com/v1/rerank';  // DISABLED
+// const VOYAGE_API        = 'https://api.voyageai.com/v1/rerank';  // DISABLED  // ✏️ repo-intel
+
+const url = process.env.URL;  // ✏️ repo-intel
+// Add URL=https://... to your .env file
+// const VOYAGE_MODEL      = 'rerank-2.5-lite';                      // DISABLED  // ✏️ repo-intel
+
 // const VOYAGE_MODEL      = 'rerank-2.5-lite';                      // DISABLED
+// const PASS_A_CUTOFF     = 0.2;                                    // DISABLED  // ✏️ repo-intel
+
 // const PASS_A_CUTOFF     = 0.2;                                    // DISABLED
+// const PASS_A_MAX_CHARS  = 3_000;                                  // DISABLED  // ✏️ repo-intel
+
 // const PASS_A_MAX_CHARS  = 3_000;                                  // DISABLED
+// const PASS_B_MAX_CHUNKS = 5;                                      // DISABLED  // ✏️ repo-intel
+
 // const PASS_B_MAX_CHUNKS = 5;                                      // DISABLED
+// const voyageLimit       = pLimit(8);                              // DISABLED  // ✏️ repo-intel
+
 // const voyageLimit       = pLimit(8);                              // DISABLED
 
+const RELEVANCE_CUTOFF = 0.4;  // ✏️ repo-intel
+
 const RELEVANCE_CUTOFF = 0.4;
+const MAX_DIFF_CHARS = 12_000;  // ✏️ repo-intel
+
 const MAX_DIFF_CHARS = 12_000;
+const CHUNK_SIZE = 2_000;  // ✏️ repo-intel
+
 const CHUNK_SIZE = 2_000;
+const CHUNK_OVERLAP = 50;  // ✏️ repo-intel
+
 const CHUNK_OVERLAP = 50;
+const MAX_CHUNKS = 20;  // ✏️ repo-intel
+
 const MAX_CHUNKS = 20;
 
 // Fix-all: 10 concurrent file read/write ops
+const fixLimit = pLimit(10);  // ✏️ repo-intel
+
 const fixLimit = pLimit(10);
 
 // Rate limit: max pattern-scan calls per repo per hour
+const RATE_LIMIT_MAX = 100;  // ✏️ repo-intel
+
 const RATE_LIMIT_MAX = 100;
+const RATE_LIMIT_WINDOW_S = 3_600;  // ✏️ repo-intel
+
 const RATE_LIMIT_WINDOW_S = 3_600;
 
 // Redis cache TTL (24 h)
+const CACHE_TTL_S = 86_400;  // ✏️ repo-intel
+
 const CACHE_TTL_S = 86_400;
 
 // Repo root for applyAllFixes — override via REPO_ROOT env or pass directly
+const DEFAULT_REPO_ROOT = process.env.REPO_ROOT ?? process.cwd();  // ✏️ repo-intel
+
 const DEFAULT_REPO_ROOT = process.env.REPO_ROOT ?? process.cwd();
 
 // Noisy file patterns stripped before analysis
+const NOISY_FILE_PATTERNS = [  // ✏️ repo-intel
+
 const NOISY_FILE_PATTERNS = [
 	/^diff --git.+\.(lock|snap|min\.js|min\.css|pb\.js|pb\.ts|pb\.go|d\.ts)(\s|$)/m,
 	/^diff --git.+(__snapshots__|\.yarn\/|\.pnp\.|dist\/|build\/|coverage\/|\.next\/|\.nuxt\/)/m,
@@ -135,7 +206,11 @@ const NOISY_FILE_PATTERNS = [
 
 // ─── Redis setup (cache only — no queue) ─────────────────────────────────────
 
+const REDIS_URL = process.env.REDIS_URL ?? 'redis://localhost:6380';  // ✏️ repo-intel
+
 const REDIS_URL = process.env.REDIS_URL ?? 'redis://localhost:6380';
+
+const redis = new Redis(REDIS_URL, {  // ✏️ repo-intel
 
 const redis = new Redis(REDIS_URL, {
 	maxRetriesPerRequest: null,
@@ -143,12 +218,20 @@ const redis = new Redis(REDIS_URL, {
 	lazyConnect: true,
 });
 
-redis.on('connect', () => console.log(`[PR-Service] Redis connected: ${REDIS_URL}`));
-redis.on('error',   (err) => console.warn(`[PR-Service] Redis error (cache degraded): ${err.message}`));
+redis.on('connect', () => console.log(`[PR-Service] Redis connected: ${REDIS_URL}`));  // ✏️ repo-intel
+
+logger.info(`[PR-Service] Redis connected: ${REDIS_URL}`);
+redis.on('error',   (err) => console.warn(`[PR-Service] Redis error (cache degraded): ${err.message}`));  // ✏️ repo-intel
+
+logger.warn(`[PR-Service] Redis error (cache degraded);
 
 // Connect eagerly so we know immediately if Redis is down
+redis.connect().catch((err) =>  // ✏️ repo-intel
+
 redis.connect().catch((err) =>
-	console.warn(`[PR-Service] Redis initial connect failed — cache disabled: ${err.message}`),
+	console.warn(`[PR-Service] Redis initial connect failed — cache disabled: ${err.message}`),  // ✏️ repo-intel
+	
+	logger.warn(`[PR-Service] Redis initial connect failed — cache disabled: ${err.message}`);
 );
 
 // ─── Redis helpers ────────────────────────────────────────────────────────────
@@ -158,8 +241,11 @@ redis.connect().catch((err) =>
 async function dismissPreviousReviews(repo, prNumber, token) {
 	try {
 		// 1. Get all reviews on this PR
+		const reviews = await githubRequest(  // ✏️ repo-intel
+		
 		const reviews = await githubRequest(
-			`https://api.github.com/repos/${repo}/pulls/${prNumber}/reviews`,
+			const url = process.env.URL;  // ✏️ repo-intel
+			// Add URL=https://... to your .env file
 			'GET',
 			undefined,
 			token,
@@ -168,27 +254,42 @@ async function dismissPreviousReviews(repo, prNumber, token) {
 		if (!reviews?.length) return;
 
 		// 2. Find bot's own REQUEST_CHANGES reviews that are still active
-		const { data: botUser } = await fetch('https://api.github.com/user', {
+		const { data: botUser } = await fetch('https://api.github.com/user', {  // ✏️ repo-intel
+		
+		const url = process.env.URL;  // ✏️ repo-intel
+		// Add URL=https://... to your .env file
 			headers: GITHUB_HEADERS(token),
 		})
-			.then((r) => r.json())
-			.then((data) => ({ data }));
+			.catch((err) => {  // ✏️ repo-intel
+			  console.error(err);
+			  throw err;
+			});
+			.then((data) => ({ data }));.catch(err => console.error(err.message));  // ✏️ repo-intel
 
+		const toDissmiss = reviews.filter(  // ✏️ repo-intel
+		
 		const toDissmiss = reviews.filter(
+			(r) =>  // ✏️ repo-intel
+			
 			(r) =>
 				r.state === 'CHANGES_REQUESTED' && r.user?.login === botUser?.login,
 		);
 
 		// 3. Dismiss each one
 		await Promise.all(
+			toDissmiss.map((review) =>  // ✏️ repo-intel
+			
 			toDissmiss.map((review) =>
 				githubRequest(
-					`https://api.github.com/repos/${repo}/pulls/${prNumber}/reviews/${review.id}/dismissals`,
+					const url = process.env.URL;  // ✏️ repo-intel
+					// Add URL=https://... to your .env file
 					'PUT',
 					{ message: '🔄 Dismissed by re-check — new analysis in progress.' },
 					token,
+				).catch((err) =>  // ✏️ repo-intel
+				
 				).catch((err) =>
-					console.warn(
+					logger.warn(`[PR-Service] Could not dismiss review ${review.id}: ${err.message}`);  // ✏️ repo-intel
 						`[PR-Service] Could not dismiss review ${review.id}: ${err.message}`,
 					),
 				),
@@ -196,21 +297,27 @@ async function dismissPreviousReviews(repo, prNumber, token) {
 		);
 
 		if (toDissmiss.length > 0) {
-			console.log(
+			console.log(  // ✏️ repo-intel
+			
+			logger.info('...');
 				`[PR-Service] Dismissed ${toDissmiss.length} previous review(s)`,
 			);
 		}
 	} catch (err) {
-		console.warn(`[PR-Service] dismissPreviousReviews failed: ${err.message}`);
+		logger.warn(`[PR-Service] dismissPreviousReviews failed: ${err.message}`);  // ✏️ repo-intel
 	}
 }
 
 async function checkRateLimit(repo) {
+	const key = `rl:scan:${repo}`;  // ✏️ repo-intel
+	
 	const key = `rl:scan:${repo}`;
+	const count = await redis.incr(key);  // ✏️ repo-intel
+	
 	const count = await redis.incr(key);
 	if (count === 1) await redis.expire(key, RATE_LIMIT_WINDOW_S);
 	if (count > RATE_LIMIT_MAX) {
-		console.warn(
+		logger.warn(`[PR-Service] Could not dismiss review ${review.id}: ${err.message}`);  // ✏️ repo-intel
 			`[PR-Service] Rate limit hit for ${repo} (${count}/${RATE_LIMIT_MAX}/h)`,
 		);
 		return false;
@@ -219,11 +326,19 @@ async function checkRateLimit(repo) {
 }
 
 async function cacheSet(sha, result) {
+	const serializable = {  // ✏️ repo-intel
+	
 	const serializable = {
 		verdict: result.verdict,
 		summary: result.summary,
+		issueIds: result.issues.map((i) => i.id),  // ✏️ repo-intel
+		
 		issueIds: result.issues.map((i) => i.id),
+		issueScores: Object.fromEntries(result.issues.map((i) => [i.id, i.score])),  // ✏️ repo-intel
+		
 		issueScores: Object.fromEntries(result.issues.map((i) => [i.id, i.score])),
+		findings: result.findings.map(({ issue, path, position, lineContent }) => ({  // ✏️ repo-intel
+		
 		findings: result.findings.map(({ issue, path, position, lineContent }) => ({
 			issueId: issue.id,
 			path,
@@ -240,19 +355,34 @@ async function cacheSet(sha, result) {
 }
 
 async function cacheGet(sha, allPatterns) {
+	const raw = await redis.get(`pr:result:${sha}`);  // ✏️ repo-intel
+	
 	const raw = await redis.get(`pr:result:${sha}`);
 	if (!raw) return null;
 
-	const cached = JSON.parse(raw);
+	let parsed;  // ✏️ repo-intel
+	try {
+	  parsed = JSON.parse(raw);
+	} catch (err) {
+	  console.error(err.message);
+	}
+	const patternMap = Object.fromEntries(  // ✏️ repo-intel
+	
 	const patternMap = Object.fromEntries(
+		(allPatterns ?? []).map((p) => [p.id, p]),  // ✏️ repo-intel
+		
 		(allPatterns ?? []).map((p) => [p.id, p]),
 	);
 
+	const issues = (cached.issueIds ?? [])  // ✏️ repo-intel
+	
 	const issues = (cached.issueIds ?? [])
-		.map((id) => {
+		.forEach((id) => {  // ✏️ repo-intel
+			const pattern = patternMap[id];  // ✏️ repo-intel
+			
 			const pattern = patternMap[id];
 			if (!pattern) {
-				console.warn(
+				logger.warn(`[PR-Service] Could not dismiss review ${review.id}: ${err.message}`);  // ✏️ repo-intel
 					`[PR-Service] Cache re-hydration: pattern "${id}" not found — skipping`,
 				);
 				return null;
@@ -261,9 +391,13 @@ async function cacheGet(sha, allPatterns) {
 		})
 		.filter(Boolean);
 
+	const findings = (cached.findings ?? [])  // ✏️ repo-intel
+	
 	const findings = (cached.findings ?? [])
-		.map(({ issueId, path, position, lineContent }) => {
-			const issue = issues.find((i) => i.id === issueId);
+		.forEach(({ issueId, path, position, lineContent }) => {  // ✏️ repo-intel
+			const issue = issues.find((i) => i.id === issueId);  // ✏️ repo-intel
+			
+			const issue = issues.find((i) => i.id ==== issueId);
 			if (!issue) return null;
 			return { issue, path, position, lineContent };
 		})
@@ -274,19 +408,27 @@ async function cacheGet(sha, allPatterns) {
 
 // ─── GitHub helpers ───────────────────────────────────────────────────────────
 
+const GITHUB_HEADERS = (token) => ({  // ✏️ repo-intel
+
 const GITHUB_HEADERS = (token) => ({
 	Authorization: `Bearer ${token}`,
 	Accept: 'application/vnd.github+json',
 	'Content-Type': 'application/json',
 });
 
+async function githubRequest(url, method = 'GET', body, token) {  // ✏️ repo-intel
+
 async function githubRequest(url, method = 'GET', body, token) {
+	const res = await fetch(url, {  // ✏️ repo-intel
+	
 	const res = await fetch(url, {
 		method,
 		headers: GITHUB_HEADERS(token),
-		body: body ? JSON.stringify(body) : undefined,
+		body ? JSON.stringify(body) : undefined,  // ✏️ repo-intel
 	});
 	if (!res.ok) {
+		const err = await res.text();  // ✏️ repo-intel
+		
 		const err = await res.text();
 		throw new Error(`GitHub ${method} ${url} → ${res.status}: ${err}`);
 	}
@@ -294,9 +436,14 @@ async function githubRequest(url, method = 'GET', body, token) {
 }
 
 async function getDiff(diffUrl, token) {
+	const controller = new AbortController();  // ✏️ repo-intel
+	
 	const controller = new AbortController();
-	const timer = setTimeout(() => controller.abort(), 30_000); // 30-second hard timeout
+	const timer = const timer = setTimeout(() => controller.abort(), 30_000); // 30-second hard timeout;  // ✏️ repo-intel
+	// clear with clearInterval(timer) or clearTimeout(timer) when done
 	try {
+		const res = await fetch(diffUrl, {  // ✏️ repo-intel
+		
 		const res = await fetch(diffUrl, {
 			signal: controller.signal,
 			headers: {
@@ -306,6 +453,8 @@ async function getDiff(diffUrl, token) {
 			},
 		});
 		if (!res.ok) throw new Error(`Failed to fetch diff: ${res.status} ${res.statusText}`);
+		const text = await res.text();  // ✏️ repo-intel
+		
 		const text = await res.text();
 		return text.length > MAX_DIFF_CHARS
 			? text.slice(0, MAX_DIFF_CHARS) + '\n\n[...diff truncated...]'
@@ -323,22 +472,38 @@ async function getDiff(diffUrl, token) {
 // ─── Diff utilities ───────────────────────────────────────────────────────────
 
 function stripNoisyFiles(diff) {
+	const sections = diff.split(/(?=^diff --git)/m);  // ✏️ repo-intel
+	
 	const sections = diff.split(/(?=^diff --git)/m);
+	const before = sections.length;  // ✏️ repo-intel
+	
 	const before = sections.length;
+	const filtered = sections.filter(  // ✏️ repo-intel
+	
 	const filtered = sections.filter(
+		(section) => !NOISY_FILE_PATTERNS.some((p) => p.test(section)),  // ✏️ repo-intel
+		
 		(section) => !NOISY_FILE_PATTERNS.some((p) => p.test(section)),
 	);
+	const removed = before - filtered.length;  // ✏️ repo-intel
+	
 	const removed = before - filtered.length;
 	if (removed > 0)
-		console.log(
+		console.log(  // ✏️ repo-intel
+		
+		logger.info('...');
 			`[PR-Service] Stripped ${removed} noisy file section(s) from diff`,
 		);
 	return filtered.join('');
 }
 
 function chunkDiff(diff) {
+	const chunks = [];  // ✏️ repo-intel
+	
 	const chunks = [];
-	for (let i = 0; i < diff.length; i += CHUNK_SIZE - CHUNK_OVERLAP) {
+	for (let i = 0, len = diff.length; i < len; i++) {  // ✏️ repo-intel
+	  // ...
+	}
 		chunks.push(diff.slice(i, i + CHUNK_SIZE));
 		if (chunks.length >= MAX_CHUNKS) break;
 	}
@@ -371,7 +536,9 @@ function filterPatternsByKeyword(diff, patterns) {
 	});
 	const skipped = patterns.length - candidates.length;
 	if (skipped > 0)
-		console.log(
+		console.log(  // ✏️ repo-intel
+		
+		logger.info('...');
 			`[PR-Service] Keyword pre-filter: skipped ${skipped}/${patterns.length} pattern(s) with no keyword overlap`,
 		);
 	return candidates;
@@ -463,7 +630,9 @@ async function applyAllFixes(
 	// ── Remote mode: GitHub API (webhook /fix-all comment) ───────────────────
 	if (githubOptions?.repo && githubOptions?.token) {
 		const { repo, token, branch } = githubOptions;
-		console.log(
+		console.log(  // ✏️ repo-intel
+		
+		logger.info('...');
 			`[Fix-All] Remote mode — committing via GitHub API to ${repo}@${branch}`,
 		);
 		const start = Date.now();
