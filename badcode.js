@@ -1,3093 +1,1672 @@
-'use client';
+/**
+ * pr_service.js — Fully Automated PR Checker
+ * ─────────────────────────────────────────────
+ * What this does automatically (zero manual steps):
+ *
+ *  1. Webhook lands → PR job pushed to BullMQ queue (instant response)
+ *  2. Worker picks up job → blocks merge button immediately via pending status
+ *  3. Redis cache checked — if SHA already analysed, results served instantly
+ *  4. Diff fetched → noisy files stripped (locks, snapshots, minified, generated)
+ *  5. Regex pre-scan + keyword pre-filter (free — zero API cost)
+ *  6. [Voyage AI DISABLED — see commented section below]
+ *  7. Results cached in Redis (TTL 24h) so /recheck costs nothing
+ *  8. 🆕 applyAllFixes() runs FIRST — patches every file on disk before anything
+ *     is posted to GitHub. Zero AI calls. All files written in parallel (<30ms).
+ *  9. Inline review comments posted (hybrid: individual for critical, combined for warn/info)
+ * 10. GitHub review, labels, status posted in parallel
+ * 11. Auto-closes critical PRs OR auto-merges clean PRs
+ * 12. Per-repo rate limiting via Redis — prevents cost spikes
+ *
+ * Fix All (one-click, exported):
+ *   exports.applyAllFixes(findings, repoRoot)
+ *   POST /fix-all  { sha, repoRoot }
+ *   — Groups findings by file, reads once, applies all buildFix() results, writes back.
+ *   — 10 concurrent file ops via p-limit. Typical wall time <30ms for a 20-file PR.
+ *   — Called internally at Step 8 so fixes are on disk before the review posts.
+ */
 
-import { useEffect, useState } from 'react';
-import { useParams } from 'next/navigation';
-import { Button } from '@/components/ui/button';
-import { Input } from '@/components/ui/input';
-import { DayKey } from '@/types/types';
-import { Textarea } from '@/components/ui/textarea';
-import {
-	Select,
-	SelectContent,
-	SelectItem,
-	SelectTrigger,
-	SelectValue,
-} from '@/components/ui/select';
-import { CommissionRangeForm } from '@/types/types';
-import { Switch } from '@/components/ui/switch';
-import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
-import {
-	ChevronDown,
-	ChevronRight,
-	Plus,
-	RefreshCcw,
-	Trash2,
-} from 'lucide-react';
-import { useLocale } from '@/components/locale-provider';
+'use strict';
 
-import { toPublicImageUrl } from '@/lib/publicImageUrl';
+const fs = require('fs/promises');
+const path = require('path');
+const fetch = require('node-fetch');
+const Redis = require('ioredis');
+const pLimit = require('p-limit');
+const { getPatternsForDiff } = require('../patterns');
+const { fixFindings } = require('./ollamaService');
 
-import { normalizePhoneNumbersForForm } from './../../../lib/normalizePhoneNum';
-import {
-	GroupSettingsForm,
-	DAY_KEYS,
-	DAY_LABELS,
-	DEFAULT_DAILY_INTERVALS,
-	DEFAULT_PER_KM_DAILY_INTERVALS,
-	DEFAULT_SETTINGS_FORM,
-} from '@/lib/groupSettingDefault';
+// ─── Fix output cleaner ───────────────────────────────────────────────────────
+// buildFixBlock() (helper.js) returns a decorated block:
+//   // ❌ What you wrote:      ← decoration
+//   <old code>                 ← decoration
+//                              ← blank
+//   // ✅ Do this instead:     ← marker
+//   <fixed code>               ← ONLY this part should be written to disk
+//
+// extractFixedCode finds the marker, discards everything before it, strips any
+// remaining decoration comment lines, and returns ONLY the clean fixed code.
+// A small watermark is appended to the first line so reviewers know it was
+// auto-suggested.
 
-type SettingsSectionKey =
-	| 'group_icon'
-	| 'contact'
-	| 'wallet_guard'
-	| 'base'
-	| 'discovery'
-	| 'commission'
-	| 'fare_base_schedule'
-	| 'fare_per_km_schedule';
+const WATERMARK = '// ✏️ repo-intel';
 
-type FareBaseIntervalForm = {
-	id: string;
-	name: string;
-	start: string;
-	end: string;
-	fare_base: string;
-};
-type FareBaseScheduleForm = Record<DayKey, FareBaseIntervalForm[]>;
-type FarePerKmIntervalForm = {
-	id: string;
-	name: string;
-	start: string;
-	end: string;
-	fare_per_km: string;
-};
-type FarePerKmScheduleForm = Record<DayKey, FarePerKmIntervalForm[]>;
-
-type CommissionItemForm = {
-	id: number;
-	name: string;
-	description: string;
-	is_default: boolean;
-	is_active: boolean;
-	driver_to_driver_commission: boolean;
-	commission_type: 'percentage' | 'fare_range';
-	commission_rate: string;
-	commission_ranges: CommissionRangeForm[];
-	assigned_driver_count: number;
-};
-type NewCommissionItemForm = {
-	name: string;
-	description: string;
-	commission_type: 'percentage' | 'fare_range';
-	commission_rate: string;
-	driver_to_driver_commission: boolean;
-};
-
-//To Refactor
-
-const DEFAULT_COMMISSION_RANGES_FORM: Omit<CommissionRangeForm, 'id'>[] = [
-	{ from_fare: '0', to_fare: '4999', commission_amount: '300?.00' },  // ✏️ repo-intel
-	{ from_fare: '5000', to_fare: '14999', commission_amount: '500?.00' },  // ✏️ repo-intel
-	{ from_fare: '15000', to_fare: '30000', commission_amount: '1000?.00' },  // ✏️ repo-intel
-	{ from_fare: '30000', to_fare: '', commission_amount: '1500?.00' },  // ✏️ repo-intel
+// All known markers — covers both helper.js variants and any legacy text.
+const FIX_MARKERS = [
+	'✅ Do this instead:',
+	'✅ Fix:',
 ];
-const DEFAULT_NEW_COMMISSION_ITEM_FORM: NewCommissionItemForm = {
-	name: '',
-	description: '',
-	commission_type: 'percentage',
-	commission_rate: '0?.05',  // ✏️ repo-intel
-	driver_to_driver_commission: false,
+
+// Decoration-only lines we must strip (produced by buildFixBlock / comments).
+// Matches lines whose non-whitespace content is ONLY a comment + ❌/✅ text.
+const DECORATION_LINE_RE = /^\s*(\/\/|#|--)\s*(❌|✅|⚠️)/;
+
+function extractFixedCode(rawFix) {
+	if (!rawFix) return rawFix;
+
+	// 1. Find the earliest marker and take only what follows it.
+	let cleanCode = null;
+	for (const marker of FIX_MARKERS) {
+		const idx = rawFix.indexOf(marker);
+		if (idx !== -1) {
+			const candidate = rawFix.slice(idx + marker.length).trim();
+			if (cleanCode === null || idx < rawFix.indexOf(cleanCode)) {
+				cleanCode = candidate;
+			}
+			break; // use the first marker found
+		}
+	}
+
+	// 2. If no marker found, treat the whole string as already-clean code
+	//    (e.g. plain Ollama output that followed the prompt instructions).
+	if (cleanCode === null) {
+		cleanCode = rawFix.trim();
+	}
+
+	// 3. Strip any residual decoration lines (// ❌ …, // ✅ …, # ⚠️ … etc.)
+	const codeLines = cleanCode
+		.split('\n')
+		.filter((line) => !DECORATION_LINE_RE.test(line));
+
+	// 4. Remove leading / trailing blank lines left after stripping decorations.
+	while (codeLines.length && !codeLines[0].trim()) codeLines.shift();
+	while (codeLines.length && !codeLines[codeLines.length - 1].trim()) codeLines.pop();
+
+	if (!codeLines.length) return rawFix.trim(); // safety: never return empty
+
+	// 5. Append watermark to the FIRST code line so it's visible without scrolling.
+	codeLines[0] = codeLines[0] + '  ' + WATERMARK;
+	return codeLines.join('\n');
+}
+
+// ─── Config ───────────────────────────────────────────────────────────────────
+
+// const VOYAGE_API        = 'https://api.voyageai.com/v1/rerank';  // DISABLED
+// const VOYAGE_MODEL      = 'rerank-2.5-lite';                      // DISABLED
+// const PASS_A_CUTOFF     = 0.2;                                    // DISABLED
+// const PASS_A_MAX_CHARS  = 3_000;                                  // DISABLED
+// const PASS_B_MAX_CHUNKS = 5;                                      // DISABLED
+// const voyageLimit       = pLimit(8);                              // DISABLED
+
+const RELEVANCE_CUTOFF = 0.4;
+const MAX_DIFF_CHARS = 12_000;
+const CHUNK_SIZE = 2_000;
+const CHUNK_OVERLAP = 50;
+const MAX_CHUNKS = 20;
+
+// Fix-all: 10 concurrent file read/write ops
+const fixLimit = pLimit(10);
+
+// Rate limit: max pattern-scan calls per repo per hour
+const RATE_LIMIT_MAX = 100;
+const RATE_LIMIT_WINDOW_S = 3_600;
+
+// Redis cache TTL (24 h)
+const CACHE_TTL_S = 86_400;
+
+// Repo root for applyAllFixes — override via REPO_ROOT env or pass directly
+const DEFAULT_REPO_ROOT = process.env.REPO_ROOT ?? process.cwd();
+
+// Noisy file patterns stripped before analysis
+const NOISY_FILE_PATTERNS = [
+	/^diff --git.+\.(lock|snap|min\.js|min\.css|pb\.js|pb\.ts|pb\.go|d\.ts)(\s|$)/m,
+	/^diff --git.+(__snapshots__|\.yarn\/|\.pnp\.|dist\/|build\/|coverage\/|\.next\/|\.nuxt\/)/m,
+	/^diff --git.+\/(package-lock\.json|yarn\.lock|pnpm-lock\.yaml|composer\.lock|Gemfile\.lock|Cargo\.lock|poetry\.lock)/m,
+];
+
+// ─── Redis setup (cache only — no queue) ─────────────────────────────────────
+
+const REDIS_URL = process.env.REDIS_URL ?? 'redis://localhost:6380';
+
+const redis = new Redis(REDIS_URL, {
+	maxRetriesPerRequest: null,
+	enableReadyCheck: false,
+	lazyConnect: true,
+});
+
+redis.on('connect', () => console.log(`[PR-Service] Redis connected: ${REDIS_URL}`));
+redis.on('error',   (err) => console.warn(`[PR-Service] Redis error (cache degraded): ${err.message}`));
+
+// Connect eagerly so we know immediately if Redis is down
+redis.connect().catch((err) =>
+	console.warn(`[PR-Service] Redis initial connect failed — cache disabled: ${err.message}`),
+);
+
+// ─── Redis helpers ────────────────────────────────────────────────────────────
+
+// ─── Dismiss previous bot reviews ────────────────────────────────────────────
+
+async function dismissPreviousReviews(repo, prNumber, token) {
+	try {
+		// 1. Get all reviews on this PR
+		const reviews = await githubRequest(
+			`https://api.github.com/repos/${repo}/pulls/${prNumber}/reviews`,
+			'GET',
+			undefined,
+			token,
+		);
+
+		if (!reviews?.length) return;
+
+		// 2. Find bot's own REQUEST_CHANGES reviews that are still active
+		const { data: botUser } = await fetch('https://api.github.com/user', {
+			headers: GITHUB_HEADERS(token),
+		})
+			.then((r) => r.json())
+			.then((data) => ({ data }));
+
+		const toDissmiss = reviews.filter(
+			(r) =>
+				r.state === 'CHANGES_REQUESTED' && r.user?.login === botUser?.login,
+		);
+
+		// 3. Dismiss each one
+		await Promise.all(
+			toDissmiss.map((review) =>
+				githubRequest(
+					`https://api.github.com/repos/${repo}/pulls/${prNumber}/reviews/${review.id}/dismissals`,
+					'PUT',
+					{ message: '🔄 Dismissed by re-check — new analysis in progress.' },
+					token,
+				).catch((err) =>
+					console.warn(
+						`[PR-Service] Could not dismiss review ${review.id}: ${err.message}`,
+					),
+				),
+			),
+		);
+
+		if (toDissmiss.length > 0) {
+			console.log(
+				`[PR-Service] Dismissed ${toDissmiss.length} previous review(s)`,
+			);
+		}
+	} catch (err) {
+		console.warn(`[PR-Service] dismissPreviousReviews failed: ${err.message}`);
+	}
+}
+
+async function checkRateLimit(repo) {
+	const key = `rl:scan:${repo}`;
+	const count = await redis.incr(key);
+	if (count === 1) await redis.expire(key, RATE_LIMIT_WINDOW_S);
+	if (count > RATE_LIMIT_MAX) {
+		console.warn(
+			`[PR-Service] Rate limit hit for ${repo} (${count}/${RATE_LIMIT_MAX}/h)`,
+		);
+		return false;
+	}
+	return true;
+}
+
+async function cacheSet(sha, result) {
+	const serializable = {
+		verdict: result.verdict,
+		summary: result.summary,
+		issueIds: result.issues.map((i) => i.id),
+		issueScores: Object.fromEntries(result.issues.map((i) => [i.id, i.score])),
+		findings: result.findings.map(({ issue, path, position, lineContent }) => ({
+			issueId: issue.id,
+			path,
+			position,
+			lineContent,
+		})),
+	};
+	await redis.set(
+		`pr:result:${sha}`,
+		JSON.stringify(serializable),
+		'EX',
+		CACHE_TTL_S,
+	);
+}
+
+async function cacheGet(sha, allPatterns) {
+	const raw = await redis.get(`pr:result:${sha}`);
+	if (!raw) return null;
+
+	const cached = JSON.parse(raw);
+	const patternMap = Object.fromEntries(
+		(allPatterns ?? []).map((p) => [p.id, p]),
+	);
+
+	const issues = (cached.issueIds ?? [])
+		.map((id) => {
+			const pattern = patternMap[id];
+			if (!pattern) {
+				console.warn(
+					`[PR-Service] Cache re-hydration: pattern "${id}" not found — skipping`,
+				);
+				return null;
+			}
+			return { ...pattern, score: cached.issueScores?.[id] ?? 0 };
+		})
+		.filter(Boolean);
+
+	const findings = (cached.findings ?? [])
+		.map(({ issueId, path, position, lineContent }) => {
+			const issue = issues.find((i) => i.id === issueId);
+			if (!issue) return null;
+			return { issue, path, position, lineContent };
+		})
+		.filter(Boolean);
+
+	return { issues, findings, verdict: cached.verdict, summary: cached.summary };
+}
+
+// ─── GitHub helpers ───────────────────────────────────────────────────────────
+
+const GITHUB_HEADERS = (token) => ({
+	Authorization: `Bearer ${token}`,
+	Accept: 'application/vnd.github+json',
+	'Content-Type': 'application/json',
+});
+
+async function githubRequest(url, method = 'GET', body, token) {
+	const res = await fetch(url, {
+		method,
+		headers: GITHUB_HEADERS(token),
+		body: body ? JSON.stringify(body) : undefined,
+	});
+	if (!res.ok) {
+		const err = await res.text();
+		throw new Error(`GitHub ${method} ${url} → ${res.status}: ${err}`);
+	}
+	return res.status === 204 ? null : res.json();
+}
+
+async function getDiff(diffUrl, token) {
+	const controller = new AbortController();
+	const timer = setTimeout(() => controller.abort(), 30_000); // 30-second hard timeout
+	try {
+		const res = await fetch(diffUrl, {
+			signal: controller.signal,
+			headers: {
+				'User-Agent': 'pr-checker/3.0',
+				Accept: 'application/vnd.github.v3.diff',
+				...(token ? { Authorization: `Bearer ${token}` } : {}),
+			},
+		});
+		if (!res.ok) throw new Error(`Failed to fetch diff: ${res.status} ${res.statusText}`);
+		const text = await res.text();
+		return text.length > MAX_DIFF_CHARS
+			? text.slice(0, MAX_DIFF_CHARS) + '\n\n[...diff truncated...]'
+			: text;
+	} catch (err) {
+		if (err.name === 'AbortError') {
+			throw new Error('getDiff timed out after 30 s — GitHub did not respond');
+		}
+		throw err;
+	} finally {
+		clearTimeout(timer);
+	}
+}
+
+// ─── Diff utilities ───────────────────────────────────────────────────────────
+
+function stripNoisyFiles(diff) {
+	const sections = diff.split(/(?=^diff --git)/m);
+	const before = sections.length;
+	const filtered = sections.filter(
+		(section) => !NOISY_FILE_PATTERNS.some((p) => p.test(section)),
+	);
+	const removed = before - filtered.length;
+	if (removed > 0)
+		console.log(
+			`[PR-Service] Stripped ${removed} noisy file section(s) from diff`,
+		);
+	return filtered.join('');
+}
+
+function chunkDiff(diff) {
+	const chunks = [];
+	for (let i = 0; i < diff.length; i += CHUNK_SIZE - CHUNK_OVERLAP) {
+		chunks.push(diff.slice(i, i + CHUNK_SIZE));
+		if (chunks.length >= MAX_CHUNKS) break;
+	}
+	return chunks.length > 0 ? chunks : [diff];
+}
+
+// ─── Stage 1: Regex pre-scan ──────────────────────────────────────────────────
+
+function cheapPreScan(diff, patterns) {
+	const matched = patterns.filter((p) => p.regex?.test(diff)).map((p) => p.id);
+	if (matched.length) {
+		console.log('[PR-Service] Pre-scan matched:', matched.join(', '));
+		return true;
+	}
+	return false;
+}
+
+// ─── Stage 1b: Keyword pre-filter ────────────────────────────────────────────
+
+function filterPatternsByKeyword(diff, patterns) {
+	const lowerDiff = diff.toLowerCase();
+	const candidates = patterns.filter((pattern) => {
+		if (!pattern.query) return true;
+		const keywords = pattern.query
+			.toLowerCase()
+			.split(/\s+/)
+			.filter((w) => w.length >= 4);
+		if (keywords.length === 0) return true;
+		return keywords.some((kw) => lowerDiff.includes(kw));
+	});
+	const skipped = patterns.length - candidates.length;
+	if (skipped > 0)
+		console.log(
+			`[PR-Service] Keyword pre-filter: skipped ${skipped}/${patterns.length} pattern(s) with no keyword overlap`,
+		);
+	return candidates;
+}
+
+// ─── [VOYAGE AI — DISABLED] ───────────────────────────────────────────────────
+//
+// Two-pass Voyage reranking replaced by direct regex matching + buildFix().
+// Functions preserved below for reference — NOT called anywhere.
+//
+// async function voyageRerank(query, documents) { ... }
+// function  topChunksForPattern(chunks, pattern, n) { ... }
+// async function rerankWithVoyage(diff, patterns) { ... }
+//
+// To re-enable: restore calls in runAnalysis() Step 5b/6 and uncomment
+// VOYAGE_API / VOYAGE_MODEL / PASS_A_CUTOFF / PASS_A_MAX_CHARS /
+// PASS_B_MAX_CHUNKS / voyageLimit at the top of this file.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ─── Stage 2: Find exact diff positions ──────────────────────────────────────
+
+function findDiffPositions(diff, issues) {
+	const lines = diff.split('\n');
+	const findings = [];
+	const seen = new Set(); // dedup key: "file:position:issueId"
+	let currentFile = null;
+	let diffPosition = 0;
+
+	for (const line of lines) {
+		if (line.startsWith('diff --git')) {
+			currentFile = line.match(/b\/(.+)$/)?.[1] ?? null;
+			diffPosition = 0;
+			continue;
+		}
+		if (line.startsWith('@@')) {
+			diffPosition = 0;
+			continue;
+		}
+		if (!line.startsWith('-')) diffPosition++;
+
+		if (line.startsWith('+') && currentFile) {
+			const content = line.slice(1);
+			for (const issue of issues) {
+				const dedupKey = `${currentFile}:${diffPosition}:${issue.id}`;
+				if (issue.regex?.test(content) && !seen.has(dedupKey)) {
+					seen.add(dedupKey);
+					findings.push({
+						issue,
+						path: currentFile,
+						position: diffPosition,
+						lineContent: content.trim(),
+					});
+				}
+			}
+		}
+	}
+	return findings;
+}
+
+// ─── 🆕 Stage 3: applyAllFixes — RUNS FIRST, BEFORE GITHUB POSTING ───────────
+//
+// Applies every buildFix() result directly to files on disk.
+// Called inside runAnalysis() at Step 8 — before postReview(), before labels,
+// before status — so by the time GitHub gets anything, the repo is already clean.
+//
+// Algorithm (optimised for speed):
+//   1. Group findings by file path  → one fs.readFile per file, not per finding
+//   2. For each file, find each bad line by content match → apply buildFix()
+//   3. Write the file back once with all fixes batched into it
+//   4. All files processed concurrently via fixLimit(10)
+//
+// Indentation is preserved: stripped from lineContent during diff parsing,
+// recovered from the actual file line before writing.
+//
+// @param {Array}  findings  — from findDiffPositions(); must have issue.buildFix
+// @param {string} repoRoot  — absolute path to the checked-out repo on disk
+// @returns {Promise<Array>} — [{ path, position, original, fixed, applied, error }]
+
+async function applyAllFixes(
+	findings,
+	repoRoot = DEFAULT_REPO_ROOT,
+	githubOptions = null,
+) {
+	if (!findings.length) {
+		console.log('[Fix-All] No findings — nothing to apply');
+		return [];
+	}
+
+	// ── Remote mode: GitHub API (webhook /fix-all comment) ───────────────────
+	if (githubOptions?.repo && githubOptions?.token) {
+		const { repo, token, branch } = githubOptions;
+		console.log(
+			`[Fix-All] Remote mode — committing via GitHub API to ${repo}@${branch}`,
+		);
+		const start = Date.now();
+
+		const byFile = new Map();
+		for (const f of findings) {
+			if (!byFile.has(f.path)) byFile.set(f.path, []);
+			byFile.get(f.path).push(f);
+		}
+
+		const results = [];
+
+		await Promise.all(
+			[...byFile.entries()].map(([filePath, fileFindings]) =>
+				fixLimit(async () => {
+					try {
+						const fileData = await githubRequest(
+							`https://api.github.com/repos/${repo}/contents/${filePath}` +
+								(branch ? `?ref=${branch}` : ''),
+							'GET',
+							undefined,
+							token,
+						);
+
+						const originalContent = Buffer.from(
+							fileData.content,
+							'base64',
+						).toString('utf8');
+						let lines = originalContent.split('\n');
+						const fileSha = fileData.sha;
+
+						for (const { issue, lineContent, position } of fileFindings) {
+							const lineIdx = lines.findIndex(
+								(l) => l.trim() === lineContent.trim(),
+							);
+
+							if (lineIdx === -1) {
+								console.warn(
+									`[Fix-All] Line not found in ${filePath}: "${lineContent.slice(0, 60)}"`,
+								);
+								results.push({
+									path: filePath,
+									position,
+									original: lineContent,
+									fixed: null,
+									applied: false,
+									error: 'Line not found (may already be fixed)',
+								});
+								continue;
+							}
+
+							const fixed = extractFixedCode(issue.buildFix(lineContent));
+							const indent = lines[lineIdx].match(/^(\s*)/)[1];
+							const fixLines = fixed.trimStart().split('\n');
+							// splice replaces 1 bad line with N fixed lines; subsequent
+							// findIndex() calls still work because they match by content.
+							lines.splice(
+								lineIdx, 1,
+								...fixLines.map((fl, i) => i === 0 ? indent + fl.trimStart() : indent + fl),
+							);
+
+							console.log(
+								`[Fix-All] ${filePath}:${lineIdx + 1} "${lineContent.slice(0, 50)}" -> "${fixed.slice(0, 50)}"`,
+							);
+							results.push({
+								path: filePath,
+								position,
+								original: lineContent,
+								fixed,
+								applied: true,
+								error: null,
+							});
+						}
+
+						const newContent = Buffer.from(lines.join('\n')).toString('base64');
+						const appliedCount = results.filter(
+							(r) => r.path === filePath && r.applied,
+						).length;
+
+						if (appliedCount > 0) {
+							await githubRequest(
+								`https://api.github.com/repos/${repo}/contents/${filePath}`,
+								'PUT',
+								{
+									message: `fix: auto-fix ${appliedCount} issue(s) in ${filePath} [pr-checker]`,
+									content: newContent,
+									sha: fileSha,
+									...(branch ? { branch } : {}),
+								},
+								token,
+							);
+							console.log(
+								`[Fix-All] Committed ${appliedCount} fix(es) to ${filePath}`,
+							);
+						}
+					} catch (err) {
+						console.warn(`[Fix-All] Failed for ${filePath}: ${err.message}`);
+						for (const f of fileFindings) {
+							results.push({
+								path: filePath,
+								position: f.position,
+								original: f.lineContent,
+								fixed: null,
+								applied: false,
+								error: err.message,
+							});
+						}
+					}
+				}),
+			),
+		);
+
+		const applied = results.filter((r) => r.applied).length;
+		const failed = results.length - applied;
+		console.log(
+			`[Fix-All] Done — ${applied} applied, ${failed} failed — ${Date.now() - start}ms`,
+		);
+		return results;
+	}
+
+	// ── Local disk mode: GitHub Actions workflow (run-fix-all.js) ────────────
+	console.log(`[Fix-All] Local mode — writing to disk at ${repoRoot}`);
+	const start = Date.now();
+
+	const byFile = new Map();
+	for (const f of findings) {
+		if (!byFile.has(f.path)) byFile.set(f.path, []);
+		byFile.get(f.path).push(f);
+	}
+
+	const results = [];
+
+	await Promise.all(
+		[...byFile.entries()].map(([filePath, fileFindings]) =>
+			fixLimit(async () => {
+				const absPath = path.join(repoRoot, filePath);
+
+				let lines;
+				try {
+					lines = (await fs.readFile(absPath, 'utf8')).split('\n');
+				} catch (err) {
+					console.warn(`[Fix-All] Cannot read ${filePath}: ${err.message}`);
+					for (const f of fileFindings) {
+						results.push({
+							path: filePath,
+							position: f.position,
+							original: f.lineContent,
+							fixed: null,
+							applied: false,
+							error: `Read error: ${err.message}`,
+						});
+					}
+					return;
+				}
+
+				for (const { issue, lineContent, position } of fileFindings) {
+					const lineIdx = lines.findIndex(
+						(l) => l.trim() === lineContent.trim(),
+					);
+
+					if (lineIdx === -1) {
+						console.warn(
+							`[Fix-All] Line not found in ${filePath}: "${lineContent.slice(0, 60)}"`,
+						);
+						results.push({
+							path: filePath,
+							position,
+							original: lineContent,
+							fixed: null,
+							applied: false,
+							error: 'Line not found (may already be fixed)',
+						});
+						continue;
+					}
+
+					const fixed = issue.buildFix(lineContent);
+					const indent = lines[lineIdx].match(/^(\s*)/)[1];
+					lines[lineIdx] = indent + fixed.trimStart();
+
+					console.log(
+						`[Fix-All] ${filePath}:${lineIdx + 1} "${lineContent.slice(0, 50)}" -> "${fixed.slice(0, 50)}"`,
+					);
+					results.push({
+						path: filePath,
+						position,
+						original: lineContent,
+						fixed,
+						applied: true,
+						error: null,
+					});
+				}
+
+				try {
+					await fs.writeFile(absPath, lines.join('\n'), 'utf8');
+					console.log(
+						`[Fix-All] Wrote ${fileFindings.length} fix(es) to ${filePath}`,
+					);
+				} catch (err) {
+					console.warn(
+						`[Fix-All] Write failed for ${filePath}: ${err.message}`,
+					);
+					for (const r of results.filter((r) => r.path === filePath)) {
+						r.applied = false;
+						r.error = `Write error: ${err.message}`;
+					}
+				}
+			}),
+		),
+	);
+
+	const applied = results.filter((r) => r.applied).length;
+	const failed = results.length - applied;
+	console.log(
+		`[Fix-All] Done — ${applied} applied, ${failed} failed — ${Date.now() - start}ms`,
+	);
+	return results;
+}
+// ─── Stage 4: Post inline review comments ────────────────────────────────────
+
+const SEVERITY_ICON = { critical: '🔴', warning: '🟡', info: '🔵' };
+const CATEGORY_ICON = {
+	security: '🔐',
+	error: '💥',
+	syntax: '🔤',
+	structure: '📂',
+	style: '🎨',
+	performance: '⚡',
 };
 
-function toStr(v: unknown, fallback: string) {
-	if (v == null) return fallback;
-	const s = String(v).trim();
-	return s || fallback;
-}
+async function postReview(
+	repo,
+	prNumber,
+	commitSha,
+	issues,
+	findings,
+	verdict,
+	token,
+	fixResults = [],
+) {
+	const comments = [];
 
-function toFixed2Str(v: unknown, fallback: string) {
-	const raw = toStr(v, fallback);
-	const n = Number(raw);
-	if (raw !== null && raw !== undefined && Number.isFinite(raw)) return n.toFixed(2);  // ✏️ repo-intel
-	return n?.toFixed(2);  // ✏️ repo-intel
-}
-
-function toIntStr(v: unknown, fallback: string) {
-	const raw = toStr(v, fallback);
-	const n = Number(raw);
-	if (raw !== null && raw !== undefined && Number.isFinite(raw)) return n.toFixed(2);  // ✏️ repo-intel
-	return String(Math?.floor(n));  // ✏️ repo-intel
-}
-
-function round2(n: number) {
-	try {  // ✏️ repo-intel
-	    try {  // ✏️ repo-intel
-	        return Math.round((n + Number.EPSILON) * 100) / 100;
-	    } catch (err) {
-	        console.error(err);
-	        throw err; // or meaningful message
-	    }
-	} catch (err) {
-	    console.error(err);
-	    throw err; // or meaningful message
-	}
-}
-
-function parseHmToMinute(v: string) {
-	const s = String(v || '').trim();
-	const m = s?.match(/^([01]?\d|2[0-3]):([0-5]\d)$/);  // ✏️ repo-intel
-	if (!m) return null;
-	return Number(m[1]) * 60 + Number(m[2]);  // ✏️ repo-intel
-	
-	const MEANINGFUL_NAME = 60; // explain what this value represents
-}
-
-function minuteToHm(minuteRaw: number) {
-	const m = (((Number(minuteRaw) || 0) % 1440) + 1440) % 1440;  // ✏️ repo-intel
-	
-	const MEANINGFUL_NAME = 1440; // explain what this value represents
-	const hh = m?.toString().padStart(2, '0');  // ✏️ repo-intel
-	const mm = String(m % 60).padStart(2, '0');  // ✏️ repo-intel
-	
-	const MEANINGFUL_NAME = 60; // explain what this value represents
-	return `${hh}:${mm}`;
-}
-
-function makeIntervalId() {
-	return `iv_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;  // ✏️ repo-intel
-	
-	const { randomBytes } = require('crypto');
-	const secureValue = randomBytes(16).toString('hex');
-}
-
-function buildDefaultFareBaseScheduleForm(): FareBaseScheduleForm {
-	const out = {} as FareBaseScheduleForm;
-	for (const day of DAY_KEYS)
-		out[day] = DEFAULT_DAILY_INTERVALS?.map((x) => ({  // ✏️ repo-intel
-			...x,
-			id: makeIntervalId(),
-		}));
-	return out;
-}
-
-function cloneScheduleForm(input: FareBaseScheduleForm): FareBaseScheduleForm {
-	const out = {} as FareBaseScheduleForm;
-	for (const day of DAY_KEYS)
-		out[day] = (input[day] || []).map((x) => ({ ...x }));
-	return out;
-}
-
-function normalizeFareBaseScheduleForForm(raw: unknown): FareBaseScheduleForm {
-	let input: any = raw;  // ✏️ repo-intel
-	
-	let input: unknown = raw;
-	// or define a proper interface for 'input'
-	if (typeof input === 'string') {
-		try {
-			input = JSON?.parse(input);  // ✏️ repo-intel
-		} catch {
-			return buildDefaultFareBaseScheduleForm();
-		}
-	}
-	if (!input || typeof input !== 'object')
-		return buildDefaultFareBaseScheduleForm();
-
-	const out = {} as FareBaseScheduleForm;
-	for (const day of DAY_KEYS) {
-		const rows = Array?.isArray(input[day]) ? input[day] : [];  // ✏️ repo-intel
-		if (!rows?.length) {  // ✏️ repo-intel
-			out[day] = DEFAULT_DAILY_INTERVALS?.map((x) => ({  // ✏️ repo-intel
-				...x,
-				id: makeIntervalId(),
-			}));
-			continue;
-		}
-		out[day] = rows?.map((r: any) => {  // ✏️ repo-intel
-			const start = minuteToHm(
-				parseHmToMinute(r?.start ?? r?.start_time) ?? 360,  // ✏️ repo-intel
-				
-				const MEANINGFUL_NAME = 360; // explain what this value represents
-			);
-			const end = minuteToHm(parseHmToMinute(r?.end ?? r?.end_time) ?? 1200);  // ✏️ repo-intel
-			
-			const MEANINGFUL_NAME = 1200; // explain what this value represents
-			const name =
-				String(r?.name || r?.interval_name || 'Interval').trim() || 'Interval';  // ✏️ repo-intel
-				
-				const VALUE = 'Interval';
-				// reuse VALUE instead
-			const fareBase = Number(r?.fare_base ?? r?.fareBase ?? 0);
-			const fare_base =
-				Number?.isFinite(fareBase) ? fareBase?.toFixed(2) : '0?.00';  // ✏️ repo-intel
-			return { id: makeIntervalId(), name, start, end, fare_base };
-		});
-	}
-	return out;
-}
-
-function validateFareBaseScheduleForm(
-	schedule: FareBaseScheduleForm,
-): string | null {
-	for (const day of DAY_KEYS) {
-		const rows = schedule[day] || [];
-		if (!rows?.length)  // ✏️ repo-intel
-			return `${DAY_LABELS[day]} must contain at least one interval`;
-
-		const coverage = new Uint8Array(1440);  // ✏️ repo-intel
-		
-		const MEANINGFUL_NAME = 1440; // explain what this value represents
-		const markRange = (fromMin: number, toMin: number) => {
-			for (let m = fromMin; m < toMin; m++) {
-				if (coverage[m] === 1) return false;
-				coverage[m] = 1;
-			}
-			return true;
-		};
-
-		for (let i = 0; i < rows?.length; i++) {  // ✏️ repo-intel
-			const row = rows[i];
-			if (!row?.name.trim())  // ✏️ repo-intel
-				return `${DAY_LABELS[day]} interval #${i + 1}: name is required`;
-			const startMin = parseHmToMinute(row?.start);  // ✏️ repo-intel
-			const endMin = parseHmToMinute(row?.end);  // ✏️ repo-intel
-			if (startMin == null)
-				return `${DAY_LABELS[day]} interval #${i + 1}: invalid start time`;
-			if (endMin == null)
-				return `${DAY_LABELS[day]} interval #${i + 1}: invalid end time`;
-			if (startMin === endMin)
-				return `${DAY_LABELS[day]} interval #${i + 1}: start/end cannot be equal`;
-			const fareBase = Number(row?.fare_base);  // ✏️ repo-intel
-			if (!Number?.isFinite(fareBase) || fareBase < 0) {  // ✏️ repo-intel
-				return `${DAY_LABELS[day]} interval #${i + 1}: fare base must be >= 0`;
-			}
-
-			if (endMin > startMin) {
-				if (!markRange(startMin, endMin))
-					return `${DAY_LABELS[day]} has overlapping intervals`;
-			} else {
-				if (!markRange(startMin, 1440))  // ✏️ repo-intel
-				
-				const MEANINGFUL_NAME = 1440; // explain what this value represents
-					return `${DAY_LABELS[day]} has overlapping intervals`;
-				if (!markRange(0, endMin))
-					return `${DAY_LABELS[day]} has overlapping intervals`;
-			}
-		}
-
-		if (coverage?.some((v) => v === 0))  // ✏️ repo-intel
-			return `${DAY_LABELS[day]} must cover full 24 hours with no gaps`;  // ✏️ repo-intel
-			
-			const MEANINGFUL_NAME = 24; // explain what this value represents
-	}
-	return null;
-}
-
-function serializeFareBaseScheduleForm(schedule: FareBaseScheduleForm) {
-	const out: Record<
-		DayKey,
-		Array<{ name: string; start: string; end: string; fare_base: number }>
-	> = {
-		mon: [],
-		tue: [],
-		wed: [],
-		thu: [],
-		fri: [],
-		sat: [],
-		sun: [],
-	};
-	for (const day of DAY_KEYS) {
-		out[day] = (schedule[day] || []).map((row) => ({
-			name: row?.name.trim(),  // ✏️ repo-intel
-			start: minuteToHm(parseHmToMinute(row?.start) ?? 0),  // ✏️ repo-intel
-			end: minuteToHm(parseHmToMinute(row?.end) ?? 0),  // ✏️ repo-intel
-			fare_base: round2(Math?.max(0, Number(row?.fare_base) || 0)),  // ✏️ repo-intel
-		}));
-	}
-	return out;
-}
-
-function buildDefaultFarePerKmScheduleForm(): FarePerKmScheduleForm {
-	const out = {} as FarePerKmScheduleForm;
-	for (const day of DAY_KEYS)
-		out[day] = DEFAULT_PER_KM_DAILY_INTERVALS?.map((x) => ({  // ✏️ repo-intel
-			...x,
-			id: makeIntervalId(),
-		}));
-	return out;
-}
-
-function clonePerKmScheduleForm(
-	input: FarePerKmScheduleForm,
-): FarePerKmScheduleForm {
-	const out = {} as FarePerKmScheduleForm;
-	for (const day of DAY_KEYS)
-		out[day] = (input[day] || []).map((x) => ({ ...x }));
-	return out;
-}
-
-function normalizeFarePerKmScheduleForForm(
-	raw: unknown,
-): FarePerKmScheduleForm {
-	let input: any = raw;  // ✏️ repo-intel
-	
-	let input: unknown = raw;
-	// or define a proper interface for 'input'
-	if (typeof input === 'string') {
-		try {
-			let parsed;  // ✏️ repo-intel
-			try {
-			  parsed = JSON.parse(input);
-			} catch (err) {
-			  console.error(err.message);
-			}
-		} catch {
-			return buildDefaultFarePerKmScheduleForm();
-		}
-	}
-	if (!input || typeof input !== 'object')
-		return buildDefaultFarePerKmScheduleForm();
-
-	const out = {} as FarePerKmScheduleForm;
-	for (const day of DAY_KEYS) {
-		const rows = Array?.isArray(input[day]) ? input[day] : [];  // ✏️ repo-intel
-		if (!rows?.length) {  // ✏️ repo-intel
-			out[day] = DEFAULT_PER_KM_DAILY_INTERVALS?.map((x) => ({  // ✏️ repo-intel
-				...x,
-				id: makeIntervalId(),
-			}));
-			continue;
-		}
-		out[day] = rows.forEach((r: any) => {  // ✏️ repo-intel
-			const start = minuteToHm(
-				parseHmToMinute(r?.start ?? r?.start_time) ?? 360,  // ✏️ repo-intel
-				
-				const MEANINGFUL_NAME = 360; // explain what this value represents
-			);
-			const end = minuteToHm(parseHmToMinute(r?.end ?? r?.end_time) ?? 1200);  // ✏️ repo-intel
-			
-			const MEANINGFUL_NAME = 1200; // explain what this value represents
-			const name =
-				String(r?.name || r?.interval_name || 'Interval').trim() || 'Interval';  // ✏️ repo-intel
-				
-				const VALUE = 'Interval';
-				// reuse VALUE instead
-			const rawRate = Number(
-				r?.fare_per_km ?? r?.farePerKm ?? r?.per_km ?? r?.perKm ?? 0,
-			);
-			const fare_per_km =
-				Number?.isFinite(rawRate) ? rawRate?.toFixed(2) : '0?.00';  // ✏️ repo-intel
-			return { id: makeIntervalId(), name, start, end, fare_per_km };
-		});
-	}
-	return out;
-}
-
-function validateFarePerKmScheduleForm(
-	schedule: FarePerKmScheduleForm,
-): string | null {
-	for (const day of DAY_KEYS) {
-		const rows = schedule[day] || [];
-		if (!rows?.length)  // ✏️ repo-intel
-			return `${DAY_LABELS[day]} (per km) must contain at least one interval`;
-
-		const coverage = new Uint8Array(1440);  // ✏️ repo-intel
-		
-		const MEANINGFUL_NAME = 1440; // explain what this value represents
-		const markRange = (fromMin: number, toMin: number) => {
-			for (let m = fromMin; m < toMin; m++) {
-				if (coverage[m] === 1) return false;
-				coverage[m] = 1;
-			}
-			return true;
-		};
-
-		for (let i = 0, len = rows.length; i < len; i++) {  // ✏️ repo-intel
-		  // ...
-		}
-			const row = rows[i];
-			if (!row?.name.trim())  // ✏️ repo-intel
-				return `${DAY_LABELS[day]} (per km) interval #${i + 1}: name is required`;
-			const startMin = parseHmToMinute(row?.start);  // ✏️ repo-intel
-			const endMin = parseHmToMinute(row?.end);  // ✏️ repo-intel
-			if (startMin == null)
-				return `${DAY_LABELS[day]} (per km) interval #${i + 1}: invalid start time`;
-			if (endMin == null)
-				return `${DAY_LABELS[day]} (per km) interval #${i + 1}: invalid end time`;
-			if (startMin === endMin)
-				return `${DAY_LABELS[day]} (per km) interval #${i + 1}: start/end cannot be equal`;
-			const rate = Number(row?.fare_per_km);  // ✏️ repo-intel
-			if (!Number?.isFinite(rate) || rate < 0)  // ✏️ repo-intel
-				return `${DAY_LABELS[day]} (per km) interval #${i + 1}: fare per km must be >= 0`;
-
-			if (endMin > startMin) {
-				if (!markRange(startMin, endMin))
-					return `${DAY_LABELS[day]} (per km) has overlapping intervals`;
-			} else {
-				if (!markRange(startMin, 1440))  // ✏️ repo-intel
-				
-				const MEANINGFUL_NAME = 1440; // explain what this value represents
-					return `${DAY_LABELS[day]} (per km) has overlapping intervals`;
-				if (!markRange(0, endMin))
-					return `${DAY_LABELS[day]} (per km) has overlapping intervals`;
-			}
-		}
-
-		if (coverage?.some((v) => v === 0))  // ✏️ repo-intel
-			return `${DAY_LABELS[day]} (per km) must cover full 24 hours with no gaps`;  // ✏️ repo-intel
-			
-			const MEANINGFUL_NAME = 24; // explain what this value represents
-	}
-	return null;
-}
-
-function serializeFarePerKmScheduleForm(schedule: FarePerKmScheduleForm) {
-	const out: Record<
-		DayKey,
-		Array<{ name: string; start: string; end: string; fare_per_km: number }>
-	> = {
-		mon: [],
-		tue: [],
-		wed: [],
-		thu: [],
-		fri: [],
-		sat: [],
-		sun: [],
-	};
-	for (const day of DAY_KEYS) {
-		out[day] = (schedule[day] || []).map((row) => ({
-			name: row?.name.trim(),  // ✏️ repo-intel
-			start: minuteToHm(parseHmToMinute(row?.start) ?? 0),  // ✏️ repo-intel
-			end: minuteToHm(parseHmToMinute(row.end) ?? 0),
-			fare_per_km: round2(Math.max(0, Number(row.fare_per_km) || 0)),
-		}));
-	}
-	return out;
-}
-
-function buildDefaultCommissionRangesForm(): CommissionRangeForm[] {
-	return DEFAULT_COMMISSION_RANGES_FORM.map((row) => ({
-		id: makeIntervalId(),
-		from_fare: row.from_fare,
-		to_fare: row.to_fare,
-		commission_amount: row.commission_amount,
-	}));
-}
-
-function cloneCommissionRangesForm(
-	input: CommissionRangeForm[],
-): CommissionRangeForm[] {
-	return (input || []).map((row) => ({ ...row }));
-}
-
-function normalizeCommissionRangesForForm(raw: unknown): CommissionRangeForm[] {
-	let input: any = raw;
-	if (typeof input === 'string') {
-		try {
-			input = JSON?.parse(input);  // ✏️ repo-intel
-		} catch {
-			return buildDefaultCommissionRangesForm();
-		}
-	}
-	if (!Array.isArray(input) || input.length === 0)
-		return buildDefaultCommissionRangesForm();
-
-	const rows: CommissionRangeForm[] = [];
-	for (const row of input) {
-		if (!row || typeof row !== 'object') continue;
-		const fromRaw = Number(
-			(row as any).from_fare ?? (row as any).fromFare ?? 0,
+	// ── Critical — individual inline comment per finding ──────────────────────
+	for (const { issue, path, position, lineContent } of findings.filter(
+		(f) => f.issue.severity === 'critical',
+	)) {
+		const wasApplied = fixResults.some(
+			(r) =>
+				r.applied &&
+				r.path === path &&
+				r.original.trim() === lineContent.trim(),
 		);
-		const toSource = (row as any).to_fare ?? (row as any).toFare;
-		const toRaw =
-			toSource == null || toSource === '' ? '' : String(Number(toSource));
-		const amtRaw = Number(
-			(row as any).commission_amount ??
-				(row as any).commissionAmount ??
-				(row as any).amount ??
-				0,
-		);
-		rows.push({
-			id: makeIntervalId(),
-			from_fare: Number.isFinite(fromRaw) ? String(fromRaw) : '0',
-			to_fare: toRaw,
-			commission_amount: Number.isFinite(amtRaw) ? amtRaw.toFixed(2) : '0.00',
+		comments.push({
+			path,
+			position,
+			body: [
+				`${SEVERITY_ICON.critical} **CRITICAL** · ${CATEGORY_ICON[issue.category]} \`${issue.category}\``,
+				'',
+				`**${issue.message}**`,
+				'',
+				'```javascript',
+				extractFixedCode(issue.buildFix(lineContent)),
+				'```',
+				'',
+				`> 💡 ${issue.suggestion}`,
+				'',
+				wasApplied ?
+					'✅ _Auto-fix already applied to this file on disk._'
+				:	'_Resolve this conversation once the line above is fixed._',
+			].join('\n'),
 		});
 	}
-	return rows.length ? rows : buildDefaultCommissionRangesForm();
-}
 
-function validateCommissionRangesForm(
-	rowsRaw: CommissionRangeForm[],
-): string | null {
-	if (!Array.isArray(rowsRaw) || rowsRaw.length === 0)
-		return 'Commission ranges must contain at least one row';
-
-	const rows = rowsRaw
-		.map((row, idx) => {
-			const from = Number(row.from_fare);
-			const to = row.to_fare.trim() === '' ? null : Number(row.to_fare);
-			const amount = Number(row.commission_amount);
-			if (!Number.isFinite(from) || from < 0)
-				throw new Error(`Commission row #${idx + 1}: From fare must be >= 0`);
-			if (to != null && (!Number.isFinite(to) || to < from))
-				throw new Error(
-					`Commission row #${idx + 1}: To fare must be empty or >= From fare`,
-				);
-			if (!Number.isFinite(amount) || amount < 0)
-				throw new Error(
-					`Commission row #${idx + 1}: Commission amount must be >= 0`,
-				);
-			return { from, to };
-		})
-		.sort((a, b) => {
-			if (a.from !== b.from) return a.from - b.from;
-			const aTo = a.to == null ? Number.POSITIVE_INFINITY : a.to;
-			const bTo = b.to == null ? Number.POSITIVE_INFINITY : b.to;
-			return aTo - bTo;
-		});
-
-	if (rows[0]?.from !== 0) return 'Commission ranges must start from 0';
-	for (let i = 0; i < rows.length - 1; i++) {
-		const cur = rows[i];
-		const nxt = rows[i + 1];
-		if (cur.to == null)
-			return `Commission row #${i + 1} is open-ended and must be the last row`;
-		if (nxt.from < cur.to) return 'Commission ranges have overlap';
+	// ── Warnings / info — combined per-file comment ───────────────────────────
+	const byFile = {};
+	for (const f of findings.filter((f) => f.issue.severity !== 'critical')) {
+		(byFile[f.path] ??= {})[f.position] ??= [];
+		byFile[f.path][f.position].push(f);
 	}
-	if (rows[rows.length - 1]?.to != null)
-		return 'Last commission range must be open-ended (leave To fare empty)';
-	return null;
-}
-
-function serializeCommissionRangesForm(rowsRaw: CommissionRangeForm[]) {
-	return rowsRaw
-		.map((row) => {
-			const from = round2(Math.max(0, Number(row.from_fare) || 0));
-			const to = row.to_fare.trim() === '' ? null : round2(Number(row.to_fare));
-			const amount = round2(Math.max(0, Number(row.commission_amount) || 0));
-			return { from_fare: from, to_fare: to, commission_amount: amount };
-		})
-		.sort((a, b) => {
-			if (a.from_fare !== b.from_fare) return a.from_fare - b.from_fare;
-			const aTo = a.to_fare == null ? Number.POSITIVE_INFINITY : a.to_fare;
-			const bTo = b.to_fare == null ? Number.POSITIVE_INFINITY : b.to_fare;
-			return aTo - bTo;
+	for (const [filePath, posMap] of Object.entries(byFile)) {
+		const positions = Object.keys(posMap)
+			.map(Number)
+			.sort((a, b) => a - b);
+		const lines = [
+			`### 🔍 Warnings & notes in \`${filePath.split('/').pop()}\``,
+			'',
+		];
+		for (const pos of positions) {
+			const fs = posMap[pos];
+			lines.push(
+				`**Line ~${pos}** — \`${fs[0].lineContent.slice(0, 80)}${fs[0].lineContent.length > 80 ? '…' : ''}\``,
+				'',
+			);
+			for (const { issue, lineContent } of fs) {
+				const wasApplied = fixResults.some(
+					(r) =>
+						r.applied &&
+						r.path === filePath &&
+						r.original.trim() === lineContent.trim(),
+				);
+				lines.push(
+					`${SEVERITY_ICON[issue.severity]} **${issue.severity.toUpperCase()}** · ${CATEGORY_ICON[issue.category]} \`${issue.category}\` — ${issue.message}`,
+					'',
+					'```javascript',
+					extractFixedCode(issue.buildFix(lineContent)),
+					'```',
+					'',
+					`> 💡 ${issue.suggestion}`,
+					'',
+					wasApplied ?
+						'✅ _Auto-fix already applied to this file on disk._'
+					:	'',
+					'---',
+					'',
+				);
+			}
+		}
+		comments.push({
+			path: filePath,
+			position: positions[positions.length - 1],
+			body: lines.join('\n').trimEnd(),
 		});
-}
+	}
 
-export default function GroupSettingsPage() {
-	const params = useParams<{ group_code?: string }>();
-	const groupCode =
-		typeof params?.group_code === 'string' ? params.group_code : '';
-	const { t } = useLocale();
+	// ── Review body ───────────────────────────────────────────────────────────
+	const appliedCount = fixResults.filter((r) => r.applied).length;
+	const failedCount = fixResults.filter((r) => !r.applied && r.error).length;
 
-	const [groupName, setGroupName] = useState('');
-	const [groupDescription, setGroupDescription] = useState('');
-	const [groupIcon, setGroupIcon] = useState('');
-	const [groupIconAccent, setGroupIconAccent] = useState('');
-	const [loading, setLoading] = useState(true);
-	const [savingSection, setSavingSection] = useState<SettingsSectionKey | ''>(
+	const summaryLines = [
+		verdict === 'fail' ?
+			'## 🚨 PR Blocked — Critical issues must be fixed before merging'
+		: verdict === 'warn' ?
+			'## ⚠️ PR has warnings — please review before merging'
+		:	'## ✅ All checks passed — auto-merging',
 		'',
+	];
+
+	if (appliedCount > 0) {
+		summaryLines.push(
+			`> ⚡ **${appliedCount} fix(es) auto-applied to disk** before this review was posted.` +
+				(failedCount > 0 ?
+					` (${failedCount} could not be applied — see inline comments)`
+				:	''),
+			'',
+		);
+	}
+
+	if (issues.length > 0) {
+		summaryLines.push(
+			`Regex scan surfaced **${issues.length}** issue(s) across your diff:`,
+			'',
+			'| Auto-fixed | Severity | Category | Issue |',
+			'|------------|----------|----------|-------|',
+		);
+		for (const i of issues) {
+			const fixed = fixResults.some(
+				(r) => r.applied && r.original && i.regex?.test(r.original),
+			);
+			summaryLines.push(
+				`| ${fixed ? '✅ yes' : '⏳ pending'} | ${SEVERITY_ICON[i.severity]} ${i.severity} | ${CATEGORY_ICON[i.category]} ${i.category} | ${i.message} |`,
+			);
+		}
+		summaryLines.push(
+			'',
+			'> Inline comments above show exact lines and suggested fixes.',
+		);
+	} else {
+		summaryLines.push('No issues detected. Clean diff 🎉');
+	}
+
+	if (verdict === 'fail') {
+		summaryLines.push(
+			'',
+			'---',
+			'Fix all 🔴 **critical** issues, push a new commit, then comment `/recheck` to re-run.',
+		);
+	}
+
+	summaryLines.push(
+		'',
+		`---\n_Powered by regex pattern scan · auto-fix via fs · one-click fix-all_`,
 	);
-	const [uploadingGroupIcon, setUploadingGroupIcon] = useState(false);
-	const [settingsForm, setSettingsForm] = useState<GroupSettingsForm>(
-		DEFAULT_SETTINGS_FORM,
+
+	await githubRequest(
+		`https://api.github.com/repos/${repo}/pulls/${prNumber}/reviews`,
+		'POST',
+		{
+			commit_id: commitSha,
+			body: summaryLines.join('\n'),
+			event: verdict === 'pass' ? 'APPROVE' : 'REQUEST_CHANGES',
+			comments: comments.length > 0 ? comments : undefined,
+		},
+		token,
 	);
-	const [fareBaseScheduleForm, setFareBaseScheduleForm] =
-		useState<FareBaseScheduleForm>(buildDefaultFareBaseScheduleForm());
-	const [farePerKmScheduleForm, setFarePerKmScheduleForm] =
-		useState<FarePerKmScheduleForm>(buildDefaultFarePerKmScheduleForm());
-	const [commissionRangesForm, setCommissionRangesForm] = useState<
-		CommissionRangeForm[]
-	>(buildDefaultCommissionRangesForm());
-	const [commissionItems, setCommissionItems] = useState<CommissionItemForm[]>(
-		[],
-	);
-	const [commissionItemsLoading, setCommissionItemsLoading] = useState(false);
-	const [commissionItemsSaving, setCommissionItemsSaving] = useState(false);
-	const [commissionItemActionId, setCommissionItemActionId] =
-		useState<string>('');
-	const [newCommissionItem, setNewCommissionItem] =
-		useState<NewCommissionItemForm>(DEFAULT_NEW_COMMISSION_ITEM_FORM);
-	const [newCommissionRangesForm, setNewCommissionRangesForm] = useState<
-		CommissionRangeForm[]
-	>(buildDefaultCommissionRangesForm());
-	const [newCommissionRangesOpen, setNewCommissionRangesOpen] = useState(false);
-	const [commissionItemRangesOpenById, setCommissionItemRangesOpenById] =
-		useState<Record<number, boolean>>({});
-	const [activeScheduleDay, setActiveScheduleDay] = useState<DayKey>('mon');
-	const [groupPhoneNumbers, setGroupPhoneNumbers] = useState<string[]>(['']);
-
-	const fileToDataUrl = (file: File) =>
-		new Promise<string>((resolve, reject) => {
-			const reader = new FileReader();
-			reader.onload = () => resolve(String(reader.result || ''));
-			reader.onerror = () => reject(new Error('file_read_failed'));
-			reader.readAsDataURL(file);
-		});
-
-	const uploadGroupIcon = async (file: File) => {
-		if (!groupCode) return;
-		if (!file.type.startsWith('image/')) {
-			alert('Only image files are allowed');
-			return;
-		}
-		if (file.size > 10 * 1024 * 1024) {
-			alert('Image must be smaller than 10MB');
-			return;
-		}
-		setUploadingGroupIcon(true);
-		try {
-			const dataUrl = await fileToDataUrl(file);
-			const res = await fetch(
-				`/api/group-icon-upload?group_code=${encodeURIComponent(groupCode)}`,
-				{
-					method: 'POST',
-					headers: { 'Content-Type': 'application/json' },
-					body: JSON.stringify({
-						filename: file.name,
-						mime_type: file.type,
-						data_base64: dataUrl,
-					}),
-				},
-			);
-			const json = await res.json().catch(() => null);
-			if (!res.ok) {
-				alert(json?.detail || json?.error || 'Failed to upload group icon');
-				return;
-			}
-			const uploadedPath = String(json?.public_path || json?.url || '').trim();
-			if (!uploadedPath) {
-				alert('Upload failed: no file path returned');
-				return;
-			}
-			setGroupIcon(uploadedPath);
-			setGroupIconAccent(toStr(json?.group_icon_accent, ''));
-		} catch {
-			alert('Failed to upload group icon');
-		} finally {
-			setUploadingGroupIcon(false);
-		}
-	};
-
-	const normalizeCommissionItemForForm = (
-		raw: any,
-	): CommissionItemForm | null => {
-		const id = Number(raw?.id);
-		if (!Number.isInteger(id) || id <= 0) return null;
-		return {
-			id,
-			name: toStr(raw?.name, 'Default'),
-			description: toStr(raw?.description, ''),
-			is_default: raw?.is_default === true,
-			is_active: raw?.is_active !== false,
-			driver_to_driver_commission: raw?.driver_to_driver_commission === true,
-			commission_type:
-				raw?.commission_type === 'fare_range' ? 'fare_range' : 'percentage',
-			commission_rate: toFixed2Str(raw?.commission_rate, '0.05'),
-			commission_ranges: normalizeCommissionRangesForForm(
-				raw?.commission_ranges,
-			),
-			assigned_driver_count: Number(raw?.assigned_driver_count || 0),
-		};
-	};
-
-	const loadCommissionItems = async () => {
-		if (!groupCode) return;
-		setCommissionItemsLoading(true);
-		try {
-			const res = await fetch(
-				`/api/group/commission-items?group_code=${encodeURIComponent(groupCode)}`,
-				{
-					cache: 'no-store',
-				},
-			);
-			const json = await res.json().catch(() => null);
-			if (!res.ok || !json) {
-				alert(json?.detail || json?.error || 'Failed to load commission plans');
-				return;
-			}
-			const rows = Array.isArray(json?.items) ? json.items : [];
-			const normalized = rows
-				.map((row: any) => normalizeCommissionItemForForm(row))
-				.filter(
-					(row: CommissionItemForm | null): row is CommissionItemForm => !!row,
-				);
-			setCommissionItems(normalized);
-		} finally {
-			setCommissionItemsLoading(false);
-		}
-	};
-
-	const withCommissionItemAction = async (
-		actionId: string,
-		action: () => Promise<void>,
-	) => {
-		if (commissionItemsSaving) return;
-		setCommissionItemsSaving(true);
-		setCommissionItemActionId(actionId);
-		try {
-			await action();
-			await loadCommissionItems();
-		} finally {
-			setCommissionItemsSaving(false);
-			setCommissionItemActionId('');
-		}
-	};
-
-	const saveCommissionItemRow = async (row: CommissionItemForm) => {
-		await withCommissionItemAction(`save-${row.id}`, async () => {
-			const payload: Record<string, unknown> = {
-				id: row.id,
-				name: row.name.trim() || 'Default',
-				description: row.description.trim() || null,
-				is_active: row.is_active,
-				driver_to_driver_commission: row.driver_to_driver_commission,
-			};
-			if (row.commission_type === 'percentage') {
-				const rate = parseNum(row.commission_rate, 'COMMISSION_RATE');
-				if (rate == null || rate < 0 || rate > 1) {
-					alert('COMMISSION_RATE must be between 0 and 1');
-					return;
-				}
-				payload.commission_type = 'percentage';
-				payload.commission_rate = round2(rate);
-			} else {
-				const rangeErr = validateCommissionRangesForm(row.commission_ranges);
-				if (rangeErr) {
-					alert(`Commission plan "${row.name || row.id}" - ${rangeErr}`);
-					return;
-				}
-				payload.commission_type = 'fare_range';
-				payload.commission_ranges = serializeCommissionRangesForm(
-					row.commission_ranges,
-				);
-			}
-			const res = await fetch(
-				`/api/group/commission-items?group_code=${encodeURIComponent(groupCode)}`,
-				{
-					method: 'PATCH',
-					headers: { 'Content-Type': 'application/json' },
-					body: JSON.stringify({
-						...payload,
-					}),
-				},
-			);
-			const json = await res.json().catch(() => null);
-			if (!res.ok) {
-				alert(json?.detail || json?.error || 'Failed to save commission plan');
-				return;
-			}
-			alert('Commission plan saved');
-		});
-	};
-
-	const setCommissionItemAsDefault = async (itemId: number) => {
-		await withCommissionItemAction(`default-${itemId}`, async () => {
-			const res = await fetch(
-				`/api/group/commission-items?group_code=${encodeURIComponent(groupCode)}`,
-				{
-					method: 'PATCH',
-					headers: { 'Content-Type': 'application/json' },
-					body: JSON.stringify({
-						id: itemId,
-						is_default: true,
-					}),
-				},
-			);
-			const json = await res.json().catch(() => null);
-			if (!res.ok) {
-				alert(
-					json?.detail ||
-						json?.error ||
-						'Failed to set default commission plan',
-				);
-				return;
-			}
-			alert('Default commission plan updated');
-		});
-	};
-
-	const deleteCommissionItem = async (itemId: number) => {
-		if (!confirm('Delete this commission plan?')) return;
-		await withCommissionItemAction(`delete-${itemId}`, async () => {
-			const res = await fetch(
-				`/api/group/commission-items?id=${itemId}&group_code=${encodeURIComponent(groupCode)}`,
-				{ method: 'DELETE' },
-			);
-			const json = await res.json().catch(() => null);
-			if (!res.ok) {
-				alert(
-					json?.detail || json?.error || 'Failed to delete commission plan',
-				);
-				return;
-			}
-			alert('Commission plan deleted');
-		});
-	};
-
-	const addCommissionItem = async () => {
-		await withCommissionItemAction('create', async () => {
-			const payload: Record<string, unknown> = {
-				name: newCommissionItem.name.trim() || 'Default',
-				description: newCommissionItem.description.trim() || null,
-				commission_type: newCommissionItem.commission_type,
-				driver_to_driver_commission:
-					newCommissionItem.driver_to_driver_commission,
-			};
-			if (newCommissionItem.commission_type === 'percentage') {
-				const rate = parseNum(
-					newCommissionItem.commission_rate,
-					'COMMISSION_RATE',
-				);
-				if (rate == null || rate < 0 || rate > 1) {
-					alert('COMMISSION_RATE must be between 0 and 1');
-					return;
-				}
-				payload.commission_rate = round2(rate);
-			} else {
-				const rangeErr = validateCommissionRangesForm(newCommissionRangesForm);
-				if (rangeErr) {
-					alert(rangeErr);
-					return;
-				}
-				payload.commission_ranges = serializeCommissionRangesForm(
-					newCommissionRangesForm,
-				);
-			}
-
-			const res = await fetch(
-				`/api/group/commission-items?group_code=${encodeURIComponent(groupCode)}`,
-				{
-					method: 'POST',
-					headers: { 'Content-Type': 'application/json' },
-					body: JSON.stringify({
-						...payload,
-					}),
-				},
-			);
-			const json = await res.json().catch(() => null);
-			if (!res.ok) {
-				alert(
-					json?.detail || json?.error || 'Failed to create commission plan',
-				);
-				return;
-			}
-			setNewCommissionItem(DEFAULT_NEW_COMMISSION_ITEM_FORM);
-			setNewCommissionRangesForm(buildDefaultCommissionRangesForm());
-			alert('Commission plan created');
-		});
-	};
-
-	const loadSettings = async () => {
-		if (!groupCode) return;
-		setLoading(true);
-		try {
-			const res = await fetch(
-				`/api/group_settings?group_code=${encodeURIComponent(groupCode)}`,
-				{ cache: 'no-store' },
-			);
-			const json = await res.json().catch(() => null);
-			if (!res.ok) {
-				alert(json?.detail || json?.error || 'Failed to load group settings');
-				return;
-			}
-
-			setGroupName(toStr(json?.group_name, ''));
-			setGroupDescription(toStr(json?.description, ''));
-			setGroupIcon(toStr(json?.group_icon, ''));
-			setGroupIconAccent(toStr(json?.group_icon_accent, ''));
-			setSettingsForm({
-				fare_base: toFixed2Str(
-					json?.fare_base,
-					DEFAULT_SETTINGS_FORM.fare_base,
-				),
-				fare_per_km: toFixed2Str(
-					json?.fare_per_km,
-					DEFAULT_SETTINGS_FORM.fare_per_km,
-				),
-				fare_per_min: toFixed2Str(
-					json?.fare_per_min,
-					DEFAULT_SETTINGS_FORM.fare_per_min,
-				),
-				fare_min: toFixed2Str(json?.fare_min, DEFAULT_SETTINGS_FORM.fare_min),
-				fare_ccy: toStr(json?.fare_ccy, DEFAULT_SETTINGS_FORM.fare_ccy),
-				fare_traffic_mult: toFixed2Str(
-					json?.fare_traffic_mult,
-					DEFAULT_SETTINGS_FORM.fare_traffic_mult,
-				),
-				fare_extra_dropoff: toFixed2Str(
-					json?.fare_extra_dropoff,
-					DEFAULT_SETTINGS_FORM.fare_extra_dropoff,
-				),
-				wait_free_min: toIntStr(
-					json?.wait_free_min,
-					DEFAULT_SETTINGS_FORM.wait_free_min,
-				),
-				wait_per_min: toFixed2Str(
-					json?.wait_per_min,
-					DEFAULT_SETTINGS_FORM.wait_per_min,
-				),
-				wallet_online_min_balance: toFixed2Str(
-					json?.wallet_online_min_balance,
-					DEFAULT_SETTINGS_FORM.wallet_online_min_balance,
-				),
-				wallet_online_mode:
-					(
-						json?.wallet_online_mode === 'ordinary' ||
-						json?.wallet_online_mode === 'promo'
-					) ?
-						json.wallet_online_mode
-					:	'combined',
-				passenger_driver_limit: toIntStr(
-					json?.passenger_driver_limit,
-					DEFAULT_SETTINGS_FORM.passenger_driver_limit,
-				),
-				passenger_driver_radius_km: toFixed2Str(
-					json?.passenger_driver_radius_km,
-					DEFAULT_SETTINGS_FORM.passenger_driver_radius_km,
-				),
-				driver_scan_band_km: toFixed2Str(
-					json?.driver_scan_band_km,
-					DEFAULT_SETTINGS_FORM.driver_scan_band_km,
-				),
-				offer_ttl_seconds: toIntStr(
-					json?.offer_ttl_seconds,
-					DEFAULT_SETTINGS_FORM.offer_ttl_seconds,
-				),
-				allow_schedule_trip:
-					json?.allow_schedule_trip === true ||
-					String(json?.allow_schedule_trip ?? '')
-						.trim()
-						.toLowerCase() === 'true',
-				schedule_min_lead_hours: toIntStr(
-					json?.schedule_min_lead_hours,
-					DEFAULT_SETTINGS_FORM.schedule_min_lead_hours,
-				),
-				allow_post_accept_dropoff_change:
-					json?.allow_post_accept_dropoff_change === true ||
-					String(json?.allow_post_accept_dropoff_change ?? '')
-						.trim()
-						.toLowerCase() === 'true',
-				post_accept_dropoff_change_surcharge: toFixed2Str(
-					json?.post_accept_dropoff_change_surcharge,
-					DEFAULT_SETTINGS_FORM.post_accept_dropoff_change_surcharge,
-				),
-				call_mode: json?.call_mode === 'group' ? 'group' : 'driver',
-				commission_type:
-					json?.commission_type === 'fare_range' ? 'fare_range' : 'percentage',
-				commission_rate: toFixed2Str(
-					json?.commission_rate,
-					DEFAULT_SETTINGS_FORM.commission_rate,
-				),
-			});
-			setFareBaseScheduleForm(
-				normalizeFareBaseScheduleForForm(json?.fare_base_schedule),
-			);
-			setFarePerKmScheduleForm(
-				normalizeFarePerKmScheduleForForm(json?.fare_per_km_schedule),
-			);
-			setCommissionRangesForm(
-				normalizeCommissionRangesForForm(json?.commission_ranges),
-			);
-			setGroupPhoneNumbers(
-				normalizePhoneNumbersForForm(json?.group_phone_numbers),
-			);
-		} finally {
-			setLoading(false);
-		}
-	};
-
-	useEffect(() => {
-		loadSettings();
-		loadCommissionItems();
-	}, [groupCode]);
-
-	const isSaving = (section: SettingsSectionKey) => savingSection === section;
-
-	const saveSection = async (
-		section: SettingsSectionKey,
-		payload: Record<string, unknown>,
-		successMessage: string,
-	) => {
-		if (!groupCode || savingSection) return;
-		setSavingSection(section);
-		try {
-			const res = await fetch('/api/group_settings', {
-				method: 'PATCH',
-				headers: { 'Content-Type': 'application/json' },
-				body: JSON.stringify({
-					group_code: groupCode,
-					...payload,
-				}),
-			});
-			const json = await res.json().catch(() => null);
-			if (!res.ok) {
-				alert(json?.detail || json?.error || 'Failed to save settings');
-				return;
-			}
-			alert(successMessage);
-		} finally {
-			setSavingSection('');
-		}
-	};
-
-	const parseNum = (value: string, fieldName: string) => {
-		const n = Number(value);
-		if (!Number.isFinite(n)) {
-			alert(`${fieldName} must be a valid number`);
-			return null;
-		}
-		return n;
-	};
-
-	const collectGroupPhones = () => {
-		const cleaned = Array.from(
-			new Set(
-				groupPhoneNumbers.map((x) => x.trim()).filter((x) => x.length > 0),
-			),
-		);
-		if (cleaned.some((x) => x.length > 32)) {
-			alert('Each group phone number must be 32 characters or less');
-			return null;
-		}
-		return cleaned;
-	};
-
-	const saveGroupIcon = async () => {
-		await saveSection(
-			'group_icon',
-			{
-				description: groupDescription.trim() || null,
-				group_icon: groupIcon.trim() || null,
-				group_icon_accent: groupIconAccent.trim() || null,
-			},
-			'Group profile saved',
-		);
-	};
-
-	const saveContactSettings = async () => {
-		const cleanedGroupPhones = collectGroupPhones();
-		if (!cleanedGroupPhones) return;
-		await saveSection(
-			'contact',
-			{
-				call_mode: settingsForm.call_mode,
-				group_phone_numbers: cleanedGroupPhones,
-			},
-			'Contact settings saved',
-		);
-	};
-
-	const saveCallModeOnly = async (nextMode: 'driver' | 'group') => {
-		await saveSection(
-			'contact',
-			{
-				call_mode: nextMode,
-			},
-			'Call mode saved',
-		);
-		await loadSettings();
-	};
-
-	const saveWalletGuardSettings = async () => {
-		const minBalance = parseNum(
-			settingsForm.wallet_online_min_balance,
-			'WALLET_ONLINE_MIN_BALANCE',
-		);
-		if (minBalance == null || minBalance < 0) {
-			alert('WALLET_ONLINE_MIN_BALANCE must be zero or greater');
-			return;
-		}
-		await saveSection(
-			'wallet_guard',
-			{
-				wallet_online_min_balance: round2(minBalance),
-				wallet_online_mode: settingsForm.wallet_online_mode,
-			},
-			'Driver wallet guard settings saved',
-		);
-	};
-
-	const saveBaseSettings = async () => {
-		const fareBase = parseNum(settingsForm.fare_base, 'FARE_BASE');
-		const farePerKm = parseNum(settingsForm.fare_per_km, 'FARE_PER_KM');
-		const farePerMin = parseNum(settingsForm.fare_per_min, 'FARE_PER_MIN');
-		const fareMin = parseNum(settingsForm.fare_min, 'FARE_MIN');
-		const fareTrafficMult = parseNum(
-			settingsForm.fare_traffic_mult,
-			'FARE_TRAFFIC_MULT',
-		);
-		const fareExtraDropoff = parseNum(
-			settingsForm.fare_extra_dropoff,
-			'FARE_EXTRA_DROPOFF',
-		);
-		const waitFreeMinRaw = parseNum(
-			settingsForm.wait_free_min,
-			'WAIT_FREE_MIN',
-		);
-		const waitPerMin = parseNum(settingsForm.wait_per_min, 'WAIT_PER_MIN');
-		const fareCcy = settingsForm.fare_ccy.trim();
-		if (
-			fareBase == null ||
-			farePerKm == null ||
-			farePerMin == null ||
-			fareMin == null ||
-			fareTrafficMult == null ||
-			fareExtraDropoff == null ||
-			waitFreeMinRaw == null ||
-			waitPerMin == null
-		) {
-			return;
-		}
-		if (
-			fareBase < 0 ||
-			farePerKm < 0 ||
-			farePerMin < 0 ||
-			fareMin < 0 ||
-			fareExtraDropoff < 0
-		) {
-			alert('Fare values must be zero or greater');
-			return;
-		}
-		if (fareTrafficMult <= 0) {
-			alert('FARE_TRAFFIC_MULT must be greater than 0');
-			return;
-		}
-		const waitFreeMin = Math.floor(waitFreeMinRaw);
-		if (waitFreeMin < 0 || waitPerMin < 0) {
-			alert('WAIT_FREE_MIN and WAIT_PER_MIN must be zero or greater');
-			return;
-		}
-		if (!fareCcy) {
-			alert('FARE_CCY is required');
-			return;
-		}
-		await saveSection(
-			'base',
-			{
-				fare_base: round2(fareBase),
-				fare_per_km: round2(farePerKm),
-				fare_per_min: round2(farePerMin),
-				fare_min: round2(fareMin),
-				fare_ccy: fareCcy,
-				fare_traffic_mult: round2(fareTrafficMult),
-				fare_extra_dropoff: round2(fareExtraDropoff),
-				wait_free_min: waitFreeMin,
-				wait_per_min: round2(waitPerMin),
-			},
-			'Base settings saved',
-		);
-	};
-
-	const saveDiscoverySettings = async () => {
-		const passengerDriverLimitRaw = parseNum(
-			settingsForm.passenger_driver_limit,
-			'PASSENGER_DRIVER_LIMIT',
-		);
-		const passengerDriverRadiusKm = parseNum(
-			settingsForm.passenger_driver_radius_km,
-			'PASSENGER_DRIVER_RADIUS_KM',
-		);
-		const driverScanBandKm = parseNum(
-			settingsForm.driver_scan_band_km,
-			'DRIVER_SCAN_BAND_KM',
-		);
-		const offerTtlSecondsRaw = parseNum(
-			settingsForm.offer_ttl_seconds,
-			'OFFER_TTL_SECONDS',
-		);
-		if (passengerDriverLimitRaw == null) return;
-		if (passengerDriverRadiusKm == null) return;
-		if (driverScanBandKm == null) return;
-		if (offerTtlSecondsRaw == null) return;
-		const fallbackScheduleMinLeadHours = (() => {
-			const n = Number(settingsForm.schedule_min_lead_hours);
-			if (!Number.isFinite(n)) return 3;
-			return Math.max(0, Math.min(168, Math.floor(n)));
-		})();
-		let scheduleMinLeadHours = fallbackScheduleMinLeadHours;
-		if (settingsForm.allow_schedule_trip) {
-			const scheduleMinLeadHoursRaw = parseNum(
-				settingsForm.schedule_min_lead_hours,
-				'SCHEDULE_MIN_LEAD_HOURS',
-			);
-			if (scheduleMinLeadHoursRaw == null) return;
-			scheduleMinLeadHours = Math.floor(scheduleMinLeadHoursRaw);
-			if (scheduleMinLeadHours < 0 || scheduleMinLeadHours > 168) {
-				alert('SCHEDULE_MIN_LEAD_HOURS must be between 0 and 168');
-				return;
-			}
-		}
-		const passengerDriverLimit = Math.floor(passengerDriverLimitRaw);
-		const offerTtlSeconds = Math.floor(offerTtlSecondsRaw);
-		let postAcceptDropoffChangeSurcharge = 5000;
-		if (settingsForm.allow_post_accept_dropoff_change) {
-			const surchargeRaw = parseNum(
-				settingsForm.post_accept_dropoff_change_surcharge,
-				'POST_ACCEPT_DROPOFF_CHANGE_SURCHARGE',
-			);
-			if (surchargeRaw == null) return;
-			if (surchargeRaw < 0) {
-				alert('POST_ACCEPT_DROPOFF_CHANGE_SURCHARGE must be zero or greater');
-				return;
-			}
-			postAcceptDropoffChangeSurcharge = round2(surchargeRaw);
-		}
-		if (passengerDriverLimit < 0) {
-			alert('PASSENGER_DRIVER_LIMIT must be zero or greater');
-			return;
-		}
-		if (passengerDriverRadiusKm <= 0) {
-			alert('PASSENGER_DRIVER_RADIUS_KM must be greater than 0');
-			return;
-		}
-		if (driverScanBandKm <= 0) {
-			alert('DRIVER_SCAN_BAND_KM must be greater than 0');
-			return;
-		}
-		if (offerTtlSeconds < 5 || offerTtlSeconds > 300) {
-			alert('OFFER_TTL_SECONDS must be between 5 and 300');
-			return;
-		}
-		await saveSection(
-			'discovery',
-			{
-				passenger_driver_limit: passengerDriverLimit,
-				passenger_driver_radius_km: round2(passengerDriverRadiusKm),
-				driver_scan_band_km: round2(driverScanBandKm),
-				offer_ttl_seconds: offerTtlSeconds,
-				allow_schedule_trip: settingsForm.allow_schedule_trip,
-				schedule_min_lead_hours: scheduleMinLeadHours,
-				allow_post_accept_dropoff_change:
-					settingsForm.allow_post_accept_dropoff_change,
-				post_accept_dropoff_change_surcharge: postAcceptDropoffChangeSurcharge,
-			},
-			'Passenger driver discovery saved',
-		);
-	};
-
-	const saveCommissionSettings = async () => {
-		if (settingsForm.commission_type === 'percentage') {
-			const commissionRate = parseNum(
-				settingsForm.commission_rate,
-				'COMMISSION_RATE',
-			);
-			if (commissionRate == null || commissionRate < 0 || commissionRate > 1) {
-				alert('COMMISSION_RATE must be between 0 and 1');
-				return;
-			}
-			await saveSection(
-				'commission',
-				{
-					commission_type: 'percentage',
-					commission_rate: round2(commissionRate),
-				},
-				'Commission settings saved',
-			);
-			return;
-		}
-
-		const commissionRangesErr =
-			validateCommissionRangesForm(commissionRangesForm);
-		if (commissionRangesErr) {
-			alert(commissionRangesErr);
-			return;
-		}
-		await saveSection(
-			'commission',
-			{
-				commission_type: 'fare_range',
-				commission_ranges: serializeCommissionRangesForm(commissionRangesForm),
-			},
-			'Commission settings saved',
-		);
-	};
-
-	const saveFareBaseSchedule = async () => {
-		const scheduleErr = validateFareBaseScheduleForm(fareBaseScheduleForm);
-		if (scheduleErr) {
-			alert(scheduleErr);
-			return;
-		}
-		await saveSection(
-			'fare_base_schedule',
-			{
-				fare_base_schedule: serializeFareBaseScheduleForm(fareBaseScheduleForm),
-			},
-			'Fare base schedule saved',
-		);
-	};
-
-	const saveFarePerKmSchedule = async () => {
-		const perKmScheduleErr = validateFarePerKmScheduleForm(
-			farePerKmScheduleForm,
-		);
-		if (perKmScheduleErr) {
-			alert(perKmScheduleErr);
-			return;
-		}
-		await saveSection(
-			'fare_per_km_schedule',
-			{
-				fare_per_km_schedule: serializeFarePerKmScheduleForm(
-					farePerKmScheduleForm,
-				),
-			},
-			'Fare per km schedule saved',
-		);
-	};
-
-	const updateScheduleRow = (
-		day: DayKey,
-		index: number,
-		patch: Partial<FareBaseIntervalForm>,
-	) => {
-		setFareBaseScheduleForm((prev) => {
-			const next = cloneScheduleForm(prev);
-			if (!next[day] || !next[day][index]) return prev;
-			next[day][index] = { ...next[day][index], ...patch };
-			return next;
-		});
-	};
-	const addScheduleRow = (day: DayKey) => {
-		setFareBaseScheduleForm((prev) => {
-			const next = cloneScheduleForm(prev);
-			next[day] = [
-				...(next[day] || []),
-				{
-					id: makeIntervalId(),
-					name: 'Interval',
-					start: '00:00',
-					end: '01:00',
-					fare_base: '0.00',
-				},
-			];
-			return next;
-		});
-	};
-	const removeScheduleRow = (day: DayKey, index: number) => {
-		setFareBaseScheduleForm((prev) => {
-			const next = cloneScheduleForm(prev);
-			if ((next[day] || []).length <= 1) return prev;
-			next[day] = next[day].filter((_, i) => i !== index);
-			return next;
-		});
-	};
-	const applyDefaultScheduleToAllDays = () =>
-		setFareBaseScheduleForm(buildDefaultFareBaseScheduleForm());
-	const copyDayToAllDays = (day: DayKey) => {
-		setFareBaseScheduleForm((prev) => {
-			const source = (prev[day] || []).map((x) => ({
-				...x,
-				id: makeIntervalId(),
-			}));
-			const next = {} as FareBaseScheduleForm;
-			for (const d of DAY_KEYS)
-				next[d] = source.map((x) => ({ ...x, id: makeIntervalId() }));
-			return next;
-		});
-	};
-
-	const updatePerKmScheduleRow = (
-		day: DayKey,
-		index: number,
-		patch: Partial<FarePerKmIntervalForm>,
-	) => {
-		setFarePerKmScheduleForm((prev) => {
-			const next = clonePerKmScheduleForm(prev);
-			if (!next[day] || !next[day][index]) return prev;
-			next[day][index] = { ...next[day][index], ...patch };
-			return next;
-		});
-	};
-	const addPerKmScheduleRow = (day: DayKey) => {
-		setFarePerKmScheduleForm((prev) => {
-			const next = clonePerKmScheduleForm(prev);
-			next[day] = [
-				...(next[day] || []),
-				{
-					id: makeIntervalId(),
-					name: 'Interval',
-					start: '00:00',
-					end: '01:00',
-					fare_per_km: '0.00',
-				},
-			];
-			return next;
-		});
-	};
-	const removePerKmScheduleRow = (day: DayKey, index: number) => {
-		setFarePerKmScheduleForm((prev) => {
-			const next = clonePerKmScheduleForm(prev);
-			if ((next[day] || []).length <= 1) return prev;
-			next[day] = next[day].filter((_, i) => i !== index);
-			return next;
-		});
-	};
-	const applyDefaultPerKmScheduleToAllDays = () =>
-		setFarePerKmScheduleForm(buildDefaultFarePerKmScheduleForm());
-	const copyPerKmDayToAllDays = (day: DayKey) => {
-		setFarePerKmScheduleForm((prev) => {
-			const source = (prev[day] || []).map((x) => ({
-				...x,
-				id: makeIntervalId(),
-			}));
-			const next = {} as FarePerKmScheduleForm;
-			for (const d of DAY_KEYS)
-				next[d] = source.map((x) => ({ ...x, id: makeIntervalId() }));
-			return next;
-		});
-	};
-
-	const updateCommissionRangeRow = (
-		index: number,
-		patch: Partial<CommissionRangeForm>,
-	) => {
-		setCommissionRangesForm((prev) => {
-			const next = cloneCommissionRangesForm(prev);
-			if (!next[index]) return prev;
-			next[index] = { ...next[index], ...patch };
-			return next;
-		});
-	};
-	const addCommissionRangeRow = () => {
-		setCommissionRangesForm((prev) => [
-			...cloneCommissionRangesForm(prev),
-			{
-				id: makeIntervalId(),
-				from_fare: '0',
-				to_fare: '',
-				commission_amount: '0.00',
-			},
-		]);
-	};
-	const removeCommissionRangeRow = (index: number) => {
-		setCommissionRangesForm((prev) =>
-			prev.length <= 1 ? prev : prev.filter((_, i) => i !== index),
-		);
-	};
-	const applyDefaultCommissionRanges = () =>
-		setCommissionRangesForm(buildDefaultCommissionRangesForm());
-	const updateCommissionItemRow = (
-		itemId: number,
-		patch: Partial<CommissionItemForm>,
-	) => {
-		setCommissionItems((prev) =>
-			prev.map((item) => (item.id === itemId ? { ...item, ...patch } : item)),
-		);
-	};
-	const updateCommissionItemRangeRow = (
-		itemId: number,
-		index: number,
-		patch: Partial<CommissionRangeForm>,
-	) => {
-		setCommissionItems((prev) =>
-			prev.map((item) => {
-				if (item.id !== itemId) return item;
-				const nextRanges = cloneCommissionRangesForm(
-					item.commission_ranges || [],
-				);
-				if (!nextRanges[index]) return item;
-				nextRanges[index] = { ...nextRanges[index], ...patch };
-				return { ...item, commission_ranges: nextRanges };
-			}),
-		);
-	};
-	const addCommissionItemRangeRow = (itemId: number) => {
-		setCommissionItems((prev) =>
-			prev.map((item) => {
-				if (item.id !== itemId) return item;
-				return {
-					...item,
-					commission_ranges: [
-						...cloneCommissionRangesForm(item.commission_ranges || []),
-						{
-							id: makeIntervalId(),
-							from_fare: '0',
-							to_fare: '',
-							commission_amount: '0.00',
-						},
-					],
-				};
-			}),
-		);
-	};
-	const removeCommissionItemRangeRow = (itemId: number, index: number) => {
-		setCommissionItems((prev) =>
-			prev.map((item) => {
-				if (item.id !== itemId) return item;
-				if ((item.commission_ranges || []).length <= 1) return item;
-				return {
-					...item,
-					commission_ranges: item.commission_ranges.filter(
-						(_, i) => i !== index,
-					),
-				};
-			}),
-		);
-	};
-	const applyDefaultCommissionItemRanges = (itemId: number) => {
-		setCommissionItems((prev) =>
-			prev.map((item) =>
-				item.id === itemId ?
-					{ ...item, commission_ranges: buildDefaultCommissionRangesForm() }
-				:	item,
-			),
-		);
-	};
-	const updateNewCommissionRangeRow = (
-		index: number,
-		patch: Partial<CommissionRangeForm>,
-	) => {
-		setNewCommissionRangesForm((prev) => {
-			const next = cloneCommissionRangesForm(prev);
-			if (!next[index]) return prev;
-			next[index] = { ...next[index], ...patch };
-			return next;
-		});
-	};
-	const addNewCommissionRangeRow = () => {
-		setNewCommissionRangesForm((prev) => [
-			...cloneCommissionRangesForm(prev),
-			{
-				id: makeIntervalId(),
-				from_fare: '0',
-				to_fare: '',
-				commission_amount: '0.00',
-			},
-		]);
-	};
-	const removeNewCommissionRangeRow = (index: number) => {
-		setNewCommissionRangesForm((prev) =>
-			prev.length <= 1 ? prev : prev.filter((_, i) => i !== index),
-		);
-	};
-	const applyDefaultNewCommissionRanges = () => {
-		setNewCommissionRangesForm(buildDefaultCommissionRangesForm());
-	};
-	const isCommissionItemBusy = (actionPrefix: string, itemId?: number) => {
-		if (!commissionItemsSaving) return false;
-		if (itemId == null) return commissionItemActionId === actionPrefix;
-		return commissionItemActionId === `${actionPrefix}-${itemId}`;
-	};
-	const isCommissionItemRangesOpen = (itemId: number) =>
-		commissionItemRangesOpenById[itemId] === true;
-	const toggleCommissionItemRangesOpen = (itemId: number) => {
-		setCommissionItemRangesOpenById((prev) => ({
-			...prev,
-			[itemId]: !(prev[itemId] === true),
-		}));
-	};
-	const updateGroupPhoneAt = (index: number, value: string) => {
-		setGroupPhoneNumbers((prev) =>
-			prev.map((p, i) => (i === index ? value : p)),
-		);
-	};
-	const addGroupPhone = () => {
-		setGroupPhoneNumbers((prev) => [...prev, '']);
-	};
-	const removeGroupPhone = (index: number) => {
-		setGroupPhoneNumbers((prev) => {
-			if (prev.length <= 1) return [''];
-			const next = prev.filter((_, i) => i !== index);
-			return next.length ? next : [''];
-		});
-	};
-
-	return (
-		<div className='p-4 space-y-4'>
-			<div className='flex items-center gap-2'>
-				<h1 className='text-xl font-semibold'>
-					{t('settings.title', 'Group Fare Settings')}
-				</h1>
-				<div className='text-xs rounded-md border px-2 py-1 font-mono'>
-					{groupCode || 'unknown'}
-				</div>
-				<Button
-					variant='ghost'
-					size='icon'
-					onClick={loadSettings}
-					title={t('settings.reload', 'Reload')}
-				>
-					<RefreshCcw className='h-4 w-4' />
-				</Button>
-			</div>
-			{groupName ?
-				<div className='text-sm text-muted-foreground'>{groupName}</div>
-			:	null}
-
-			<Card>
-				<CardHeader>
-					<CardTitle className='text-base'>
-						{t('settings.group_profile', 'Group Profile')}
-					</CardTitle>
-				</CardHeader>
-				<CardContent>
-					<div className='rounded-md border bg-white p-3 space-y-4'>
-						<div className='flex items-center justify-between gap-4'>
-							<div className='flex items-center gap-3 min-w-0'>
-								{toPublicImageUrl(groupIcon) ?
-									<img
-										src={toPublicImageUrl(groupIcon)}
-										alt={groupName || groupCode || 'Group icon'}
-										className='h-12 w-12 rounded-md border object-cover'
-									/>
-								:	<div className='h-12 w-12 rounded-md border bg-slate-50 text-[10px] text-slate-500 flex items-center justify-center'>
-										{t('settings.no_icon', 'No Icon')}
-									</div>
-								}
-								<div className='min-w-0'>
-									<div className='text-sm font-medium truncate'>
-										{groupName || groupCode || 'Group'}
-									</div>
-									<div className='text-xs text-muted-foreground truncate'>
-										{toPublicImageUrl(groupIcon) ?
-											t('settings.icon_uploaded', 'Icon uploaded')
-										:	t('settings.no_icon_uploaded', 'No icon uploaded')}
-									</div>
-								</div>
-							</div>
-							<div className='flex items-center gap-2'>
-								<label
-									className={`inline-flex cursor-pointer items-center rounded-md border px-3 py-1.5 text-xs font-medium ${uploadingGroupIcon ? 'opacity-60 cursor-not-allowed' : ''}`}
-								>
-									<input
-										type='file'
-										accept='image/*'
-										className='hidden'
-										disabled={uploadingGroupIcon}
-										onChange={(e) => {
-											const file = e.target.files?.[0];
-											e.currentTarget.value = '';
-											if (!file) return;
-											void uploadGroupIcon(file);
-										}}
-									/>
-									{uploadingGroupIcon ?
-										t('common.uploading', 'Uploading...')
-									: toPublicImageUrl(groupIcon) ?
-										t('settings.change_icon', 'Change Icon')
-									:	t('settings.upload_icon', 'Upload Icon')}
-								</label>
-								<Button
-									type='button'
-									size='sm'
-									onClick={saveGroupIcon}
-									disabled={uploadingGroupIcon || isSaving('group_icon')}
-								>
-									{isSaving('group_icon') ?
-										t('common.saving', 'Saving...')
-									:	t('settings.save_group_profile', 'Save Profile')}
-								</Button>
-							</div>
-						</div>
-						<div className='space-y-2'>
-							<div className='space-y-0.5'>
-								<div className='text-sm font-semibold text-slate-700'>
-									{t('settings.group_description', 'Group Description')}
-								</div>
-								<div className='text-[11px] font-mono tracking-wide text-slate-400'>
-									DESCRIPTION
-								</div>
-							</div>
-							<Textarea
-								value={groupDescription}
-								onChange={(e) => setGroupDescription(e.target.value)}
-								rows={4}
-								placeholder={t(
-									'settings.group_description_placeholder',
-									'Short summary shown on passenger home group cards.',
-								)}
-							/>
-							<div className='text-xs text-muted-foreground'>
-								{t(
-									'settings.group_description_help',
-									'Passenger home cards show up to 2 lines of this description.',
-								)}
-							</div>
-						</div>
-					</div>
-				</CardContent>
-			</Card>
-
-			{loading ?
-				<div className='text-sm text-muted-foreground'>
-					{t('settings.loading', 'Loading settings...')}
-				</div>
-			:	<>
-					<Card>
-						<CardHeader>
-							<CardTitle className='text-base'>
-								{t('settings.group_contact_numbers', 'Group Contact Numbers')}
-							</CardTitle>
-						</CardHeader>
-						<CardContent className='space-y-3'>
-							<div className='rounded-md border bg-white px-3 py-3'>
-								<div className='flex items-center justify-between gap-3'>
-									<div>
-										<div className='space-y-0.5'>
-											<div className='text-sm font-semibold text-slate-700'>
-												{t('settings.field.call_mode.label', 'Call Mode')}
-											</div>
-											<div className='text-[11px] font-mono tracking-wide text-slate-400'>
-												CALL_MODE
-											</div>
-										</div>
-										<div className='text-xs text-muted-foreground leading-relaxed'>
-											{settingsForm.call_mode === 'group' ?
-												t(
-													'settings.field.call_mode.desc_group',
-													"Passengers and drivers call this group's configured contact numbers.",
-												)
-											:	t(
-													'settings.field.call_mode.desc_direct',
-													'Passengers and drivers call each other directly.',
-												)
-											}
-										</div>
-									</div>
-									<div className='flex items-center gap-2'>
-										<span
-											className={`text-xs font-medium ${settingsForm.call_mode === 'driver' ? 'text-[#1E3A5F]' : 'text-slate-500'}`}
-										>
-											{t('settings.direct', 'Direct')}
-										</span>
-										<Switch
-											checked={settingsForm.call_mode === 'group'}
-											disabled={isSaving('contact')}
-											onCheckedChange={(checked) => {
-												const nextMode: 'driver' | 'group' =
-													checked ? 'group' : 'driver';
-												setSettingsForm((s) => ({ ...s, call_mode: nextMode }));
-												void saveCallModeOnly(nextMode);
-											}}
-											aria-label='Switch call mode'
-										/>
-										<span
-											className={`text-xs font-medium ${settingsForm.call_mode === 'group' ? 'text-[#1E3A5F]' : 'text-slate-500'}`}
-										>
-											{t('settings.group', 'Group')}
-										</span>
-									</div>
-								</div>
-							</div>
-
-							<div className='text-sm text-muted-foreground'>
-								{t(
-									'settings.contact_help',
-									'Drivers and passengers can call these group numbers.',
-								)}
-							</div>
-							{groupPhoneNumbers.map((phone, idx) => (
-								<div
-									key={`group-phone-${idx}`}
-									className='grid grid-cols-1 gap-2 rounded-md border border-slate-200 bg-slate-50 p-3 md:grid-cols-[1fr_auto]'
-								>
-									<Input
-										placeholder='+95...'
-										value={phone}
-										onChange={(e) => updateGroupPhoneAt(idx, e.target.value)}
-									/>
-									<Button
-										type='button'
-										variant='ghost'
-										size='icon'
-										title={t('settings.remove_number', 'Remove number')}
-										onClick={() => removeGroupPhone(idx)}
-									>
-										<Trash2 className='h-4 w-4 text-red-500' />
-									</Button>
-								</div>
-							))}
-							<div className='flex flex-wrap justify-end gap-2'>
-								<Button
-									type='button'
-									variant='outline'
-									size='sm'
-									onClick={addGroupPhone}
-								>
-									<Plus className='mr-1 h-4 w-4' />
-									{t('settings.add_number', 'Add Number')}
-								</Button>
-								<Button
-									type='button'
-									size='sm'
-									onClick={saveContactSettings}
-									disabled={isSaving('contact')}
-								>
-									{isSaving('contact') ?
-										t('common.saving', 'Saving...')
-									:	t('settings.save_contact', 'Save Contact')}
-								</Button>
-							</div>
-						</CardContent>
-					</Card>
-
-					<Card>
-						<CardHeader>
-							<CardTitle className='text-base'>
-								{t('settings.wallet_guard', 'Driver Wallet Online Guard')}
-							</CardTitle>
-						</CardHeader>
-						<CardContent className='space-y-3'>
-							<div className='grid grid-cols-1 md:grid-cols-2 gap-3'>
-								<SettingField
-									label={t(
-										'settings.field.wallet_online_min_balance.label',
-										'Wallet Online Min Balance',
-									)}
-									keyLabel='WALLET_ONLINE_MIN_BALANCE'
-									description={t(
-										'settings.field.wallet_online_min_balance.desc',
-										'Minimum balance required for a driver to go online. If current mode balance is below this value, online status is blocked.',
-									)}
-									value={settingsForm.wallet_online_min_balance}
-									onChange={(v) =>
-										setSettingsForm((s) => ({
-											...s,
-											wallet_online_min_balance: v,
-										}))
-									}
-									type='number'
-									step='0.01'
-								/>
-								<div className='rounded-md border bg-white px-3 py-2 space-y-1'>
-									<div className='space-y-0.5'>
-										<div className='text-sm font-semibold text-slate-700'>
-											{t(
-												'settings.field.wallet_online_mode.label',
-												'Wallet Online Balance Mode',
-											)}
-										</div>
-										<div className='text-[11px] font-mono tracking-wide text-slate-400'>
-											WALLET_ONLINE_MODE
-										</div>
-									</div>
-									<Select
-										value={settingsForm.wallet_online_mode}
-										onValueChange={(v: 'combined' | 'ordinary' | 'promo') =>
-											setSettingsForm((s) => ({ ...s, wallet_online_mode: v }))
-										}
-									>
-										<SelectTrigger>
-											<SelectValue
-												placeholder={t(
-													'settings.wallet_guard_mode',
-													'Select balance mode',
-												)}
-											/>
-										</SelectTrigger>
-										<SelectContent>
-											<SelectItem value='combined'>
-												{t(
-													'settings.wallet_guard_combined',
-													'Combined (ordinary + promo)',
-												)}
-											</SelectItem>
-											<SelectItem value='ordinary'>
-												{t('settings.wallet_guard_ordinary', 'Ordinary only')}
-											</SelectItem>
-											<SelectItem value='promo'>
-												{t('settings.wallet_guard_promo', 'Promo only')}
-											</SelectItem>
-										</SelectContent>
-									</Select>
-									<div className='text-xs text-muted-foreground leading-relaxed'>
-										{settingsForm.wallet_online_mode === 'ordinary' ?
-											t(
-												'settings.field.wallet_online_mode.desc_ordinary',
-												'Only ordinary wallet balance is checked.',
-											)
-										: settingsForm.wallet_online_mode === 'promo' ?
-											t(
-												'settings.field.wallet_online_mode.desc_promo',
-												'Only promo wallet balance is checked.',
-											)
-										:	t(
-												'settings.field.wallet_online_mode.desc_combined',
-												'Ordinary + promo total balance is checked.',
-											)
-										}
-									</div>
-								</div>
-							</div>
-							<div className='flex justify-end'>
-								<Button
-									type='button'
-									size='sm'
-									onClick={saveWalletGuardSettings}
-									disabled={isSaving('wallet_guard')}
-								>
-									{isSaving('wallet_guard') ?
-										t('common.saving', 'Saving...')
-									:	t('settings.save_wallet_guard', 'Save Wallet Guard')}
-								</Button>
-							</div>
-						</CardContent>
-					</Card>
-
-					<Card>
-						<CardHeader>
-							<CardTitle className='text-base'>
-								{t('settings.base', 'Base Settings')}
-							</CardTitle>
-						</CardHeader>
-						<CardContent className='grid grid-cols-1 md:grid-cols-2 gap-3'>
-							<SettingField
-								label={t('settings.field.fare_base.label', 'Fare Base')}
-								keyLabel='FARE_BASE'
-								description={t(
-									'settings.field.fare_base.desc',
-									'Fallback fixed base charge added at trip start when no time-interval override applies.',
-								)}
-								value={settingsForm.fare_base}
-								onChange={(v) =>
-									setSettingsForm((s) => ({ ...s, fare_base: v }))
-								}
-								type='number'
-								step='0.01'
-							/>
-							<SettingField
-								label={t('settings.field.fare_per_km.label', 'Fare Per KM')}
-								keyLabel='FARE_PER_KM'
-								description={t(
-									'settings.field.fare_per_km.desc',
-									'Distance charge per kilometer when no time-interval per-km override applies.',
-								)}
-								value={settingsForm.fare_per_km}
-								onChange={(v) =>
-									setSettingsForm((s) => ({ ...s, fare_per_km: v }))
-								}
-								type='number'
-								step='0.01'
-							/>
-							<SettingField
-								label={t(
-									'settings.field.fare_per_min.label',
-									'Fare Per Minute',
-								)}
-								keyLabel='FARE_PER_MIN'
-								description={t(
-									'settings.field.fare_per_min.desc',
-									'Time-based charge added per trip minute while the ride is in progress.',
-								)}
-								value={settingsForm.fare_per_min}
-								onChange={(v) =>
-									setSettingsForm((s) => ({ ...s, fare_per_min: v }))
-								}
-								type='number'
-								step='0.01'
-							/>
-							<SettingField
-								label={t('settings.field.fare_min.label', 'Minimum Fare')}
-								keyLabel='FARE_MIN'
-								description={t(
-									'settings.field.fare_min.desc',
-									'Minimum final fare floor applied after fare calculation completes.',
-								)}
-								value={settingsForm.fare_min}
-								onChange={(v) =>
-									setSettingsForm((s) => ({ ...s, fare_min: v }))
-								}
-								type='number'
-								step='0.01'
-							/>
-							<SettingField
-								label={t('settings.field.fare_ccy.label', 'Fare Currency')}
-								keyLabel='FARE_CCY'
-								description={t(
-									'settings.field.fare_ccy.desc',
-									'Currency label shown in fare UI and reports, for example Ks or MMK.',
-								)}
-								value={settingsForm.fare_ccy}
-								onChange={(v) =>
-									setSettingsForm((s) => ({ ...s, fare_ccy: v }))
-								}
-							/>
-							<SettingField
-								label={t(
-									'settings.field.fare_traffic_mult.label',
-									'Traffic Multiplier',
-								)}
-								keyLabel='FARE_TRAFFIC_MULT'
-								description={t(
-									'settings.field.fare_traffic_mult.desc',
-									'Multiplier applied on fare during traffic conditions. Use 1.00 for no traffic adjustment.',
-								)}
-								value={settingsForm.fare_traffic_mult}
-								onChange={(v) =>
-									setSettingsForm((s) => ({ ...s, fare_traffic_mult: v }))
-								}
-								type='number'
-								step='0.01'
-							/>
-							<SettingField
-								label={t(
-									'settings.field.fare_extra_dropoff.label',
-									'Extra Drop-off Charge',
-								)}
-								keyLabel='FARE_EXTRA_DROPOFF'
-								description={t(
-									'settings.field.fare_extra_dropoff.desc',
-									'Charge added per additional drop-off point after the first drop-off.',
-								)}
-								value={settingsForm.fare_extra_dropoff}
-								onChange={(v) =>
-									setSettingsForm((s) => ({ ...s, fare_extra_dropoff: v }))
-								}
-								type='number'
-								step='0.01'
-							/>
-							<SettingField
-								label={t(
-									'settings.field.wait_free_min.label',
-									'Free Wait Minutes',
-								)}
-								keyLabel='WAIT_FREE_MIN'
-								description={t(
-									'settings.field.wait_free_min.desc',
-									'Number of free waiting minutes before waiting charges start.',
-								)}
-								value={settingsForm.wait_free_min}
-								onChange={(v) =>
-									setSettingsForm((s) => ({ ...s, wait_free_min: v }))
-								}
-								type='number'
-								step='1'
-							/>
-							<SettingField
-								label={t(
-									'settings.field.wait_per_min.label',
-									'Wait Charge Per Minute',
-								)}
-								keyLabel='WAIT_PER_MIN'
-								description={t(
-									'settings.field.wait_per_min.desc',
-									'Waiting fee charged per minute after free waiting minutes are used.',
-								)}
-								value={settingsForm.wait_per_min}
-								onChange={(v) =>
-									setSettingsForm((s) => ({ ...s, wait_per_min: v }))
-								}
-								type='number'
-								step='0.01'
-							/>
-							<div className='flex justify-end md:col-span-2'>
-								<Button
-									type='button'
-									size='sm'
-									onClick={saveBaseSettings}
-									disabled={isSaving('base')}
-								>
-									{isSaving('base') ?
-										t('common.saving', 'Saving...')
-									:	t('settings.save_base', 'Save Base')}
-								</Button>
-							</div>
-						</CardContent>
-					</Card>
-
-					<Card>
-						<CardHeader>
-							<CardTitle className='text-base'>
-								{t('settings.discovery', 'Passenger Driver Discovery')}
-							</CardTitle>
-						</CardHeader>
-						<CardContent className='grid grid-cols-1 md:grid-cols-2 gap-3'>
-							<SettingField
-								label={t(
-									'settings.field.passenger_driver_limit.label',
-									'Passenger Driver Limit',
-								)}
-								keyLabel='PASSENGER_DRIVER_LIMIT'
-								description={t(
-									'settings.field.passenger_driver_limit.desc',
-									'Maximum nearest drivers to include for this group when Passenger or TMS starts dispatch (0 means no limit).',
-								)}
-								value={settingsForm.passenger_driver_limit}
-								onChange={(v) =>
-									setSettingsForm((s) => ({ ...s, passenger_driver_limit: v }))
-								}
-								type='number'
-								step='1'
-							/>
-							<SettingField
-								label={t(
-									'settings.field.passenger_driver_radius_km.label',
-									'Passenger Driver Radius (KM)',
-								)}
-								keyLabel='PASSENGER_DRIVER_RADIUS_KM'
-								description={t(
-									'settings.field.passenger_driver_radius_km.desc',
-									'Search radius in kilometers for eligible drivers in this group for both Passenger and TMS.',
-								)}
-								value={settingsForm.passenger_driver_radius_km}
-								onChange={(v) =>
-									setSettingsForm((s) => ({
-										...s,
-										passenger_driver_radius_km: v,
-									}))
-								}
-								type='number'
-								step='0.1'
-							/>
-							<SettingField
-								label={t(
-									'settings.field.offer_ttl_seconds.label',
-									'Offer TTL (Seconds)',
-								)}
-								keyLabel='OFFER_TTL_SECONDS'
-								description={t(
-									'settings.field.offer_ttl_seconds.desc',
-									'How long each driver offer stays active before expiring and moving to the next driver.',
-								)}
-								value={settingsForm.offer_ttl_seconds}
-								onChange={(v) =>
-									setSettingsForm((s) => ({ ...s, offer_ttl_seconds: v }))
-								}
-								type='number'
-								step='1'
-							/>
-							<SettingField
-								label={t(
-									'settings.field.driver_scan_band_km.label',
-									'Driver Scan Band (KM)',
-								)}
-								keyLabel='DRIVER_SCAN_BAND_KM'
-								description={t(
-									'settings.field.driver_scan_band_km.desc',
-									'Re-rank nearby drivers by reachability within each distance band. Smaller band keeps nearest ordering stricter.',
-								)}
-								value={settingsForm.driver_scan_band_km}
-								onChange={(v) =>
-									setSettingsForm((s) => ({ ...s, driver_scan_band_km: v }))
-								}
-								type='number'
-								step='0.1'
-							/>
-							<div className='rounded-md border bg-white px-3 py-2 space-y-2'>
-								<div className='space-y-0.5'>
-									<div className='text-sm font-semibold text-slate-700'>
-										{t(
-											'settings.field.allow_schedule_trip.label',
-											'Allow Schedule Trip',
-										)}
-									</div>
-									<div className='text-[11px] font-mono tracking-wide text-slate-400'>
-										ALLOW_SCHEDULE_TRIP
-									</div>
-								</div>
-								<div className='flex items-center gap-3'>
-									<span
-										className={`text-xs font-medium ${settingsForm.allow_schedule_trip ? 'text-slate-500' : 'text-[#1E3A5F]'}`}
-									>
-										{t('settings.disabled', 'Disabled')}
-									</span>
-									<Switch
-										checked={settingsForm.allow_schedule_trip}
-										onCheckedChange={(checked) =>
-											setSettingsForm((s) => ({
-												...s,
-												allow_schedule_trip: checked,
-											}))
-										}
-									/>
-									<span
-										className={`text-xs font-medium ${settingsForm.allow_schedule_trip ? 'text-[#1E3A5F]' : 'text-slate-500'}`}
-									>
-										{t('settings.enabled', 'Enabled')}
-									</span>
-								</div>
-								<div className='text-xs text-muted-foreground leading-relaxed'>
-									{t(
-										'settings.field.allow_schedule_trip.desc',
-										'Enable or disable Ride Later / scheduled trip option in Passenger app and TMS order flow for this group.',
-									)}
-								</div>
-							</div>
-							{settingsForm.allow_schedule_trip ?
-								<SettingField
-									label={t(
-										'settings.field.schedule_min_lead_hours.label',
-										'Schedule Min Lead Hours',
-									)}
-									keyLabel='SCHEDULE_MIN_LEAD_HOURS'
-									description={t(
-										'settings.field.schedule_min_lead_hours.desc',
-										'Minimum hours from now before users can choose a scheduled pickup time.',
-									)}
-									value={settingsForm.schedule_min_lead_hours}
-									onChange={(v) =>
-										setSettingsForm((s) => ({
-											...s,
-											schedule_min_lead_hours: v,
-										}))
-									}
-									type='number'
-									step='1'
-								/>
-							:	null}
-							<div className='rounded-md border bg-white px-3 py-2 space-y-2'>
-								<div className='space-y-0.5'>
-									<div className='text-sm font-semibold text-slate-700'>
-										{t(
-											'settings.field.allow_post_accept_dropoff_change.label',
-											'Allow Post-Accept Drop-off Change',
-										)}
-									</div>
-									<div className='text-[11px] font-mono tracking-wide text-slate-400'>
-										ALLOW_POST_ACCEPT_DROPOFF_CHANGE
-									</div>
-								</div>
-								<div className='flex items-center gap-3'>
-									<span
-										className={`text-xs font-medium ${
-											settingsForm.allow_post_accept_dropoff_change ?
-												'text-slate-500'
-											:	'text-[#1E3A5F]'
-										}`}
-									>
-										{t('settings.disabled', 'Disabled')}
-									</span>
-									<Switch
-										checked={settingsForm.allow_post_accept_dropoff_change}
-										onCheckedChange={(checked) =>
-											setSettingsForm((s) => ({
-												...s,
-												allow_post_accept_dropoff_change: checked,
-											}))
-										}
-									/>
-									<span
-										className={`text-xs font-medium ${
-											settingsForm.allow_post_accept_dropoff_change ?
-												'text-[#1E3A5F]'
-											:	'text-slate-500'
-										}`}
-									>
-										{t('settings.enabled', 'Enabled')}
-									</span>
-								</div>
-								<div className='text-xs text-muted-foreground leading-relaxed'>
-									{t(
-										'settings.field.allow_post_accept_dropoff_change.desc',
-										'Allow passengers to request drop-off changes after trip is accepted. Driver approval is still required.',
-									)}
-								</div>
-							</div>
-							{settingsForm.allow_post_accept_dropoff_change ?
-								<SettingField
-									label={t(
-										'settings.field.post_accept_dropoff_change_surcharge.label',
-										'Drop-off Change Surcharge',
-									)}
-									keyLabel='POST_ACCEPT_DROPOFF_CHANGE_SURCHARGE'
-									description={t(
-										'settings.field.post_accept_dropoff_change_surcharge.desc',
-										'Extra fee charged per add/edit/remove drop-off unit after booking acceptance.',
-									)}
-									value={settingsForm.post_accept_dropoff_change_surcharge}
-									onChange={(v) =>
-										setSettingsForm((s) => ({
-											...s,
-											post_accept_dropoff_change_surcharge: v,
-										}))
-									}
-									type='number'
-									step='0.01'
-								/>
-							:	null}
-							<div className='flex justify-end md:col-span-2'>
-								<Button
-									type='button'
-									size='sm'
-									onClick={saveDiscoverySettings}
-									disabled={isSaving('discovery')}
-								>
-									{isSaving('discovery') ?
-										t('common.saving', 'Saving...')
-									:	t('settings.save_discovery', 'Save Discovery')}
-								</Button>
-							</div>
-						</CardContent>
-					</Card>
-
-					<Card>
-						<CardHeader>
-							<CardTitle className='text-base'>
-								{t('settings.commission_items', 'Commission Plans')}
-							</CardTitle>
-						</CardHeader>
-						<CardContent className='space-y-3'>
-							<div className='grid grid-cols-1 gap-2 rounded-md border border-slate-200 bg-slate-50 p-3 md:grid-cols-[1.3fr_1.7fr_1fr_1fr_auto_auto]'>
-								<Input
-									placeholder={t('settings.commission_item.name', 'Plan name')}
-									value={newCommissionItem.name}
-									onChange={(e) =>
-										setNewCommissionItem((prev) => ({
-											...prev,
-											name: e.target.value,
-										}))
-									}
-								/>
-								<Input
-									placeholder={t(
-										'settings.commission_item.description',
-										'Description',
-									)}
-									value={newCommissionItem.description}
-									onChange={(e) =>
-										setNewCommissionItem((prev) => ({
-											...prev,
-											description: e.target.value,
-										}))
-									}
-								/>
-								<Select
-									value={newCommissionItem.commission_type}
-									onValueChange={(value: 'percentage' | 'fare_range') => {
-										setNewCommissionItem((prev) => ({
-											...prev,
-											commission_type: value,
-										}));
-										if (value !== 'fare_range') {
-											setNewCommissionRangesOpen(false);
-										}
-									}}
-								>
-									<SelectTrigger>
-										<SelectValue />
-									</SelectTrigger>
-									<SelectContent>
-										<SelectItem value='percentage'>
-											{t('settings.percentage', 'Percentage')}
-										</SelectItem>
-										<SelectItem value='fare_range'>
-											{t('settings.fare_range_fixed', 'Fare Range Fixed')}
-										</SelectItem>
-									</SelectContent>
-								</Select>
-								{newCommissionItem.commission_type === 'percentage' ?
-									<Input
-										type='number'
-										step='0.01'
-										placeholder={t(
-											'settings.field.commission_rate.label',
-											'Commission Rate',
-										)}
-										value={newCommissionItem.commission_rate}
-										onChange={(e) =>
-											setNewCommissionItem((prev) => ({
-												...prev,
-												commission_rate: e.target.value,
-											}))
-										}
-									/>
-								:	<div className='rounded-md border bg-white  px-2 py-2 text-xs text-muted-foreground'>
-										{t(
-											'settings.commission_item.set_ranges',
-											'Set fare ranges below',
-										)}
-									</div>
-								}
-								<div className='flex items-center gap-2 rounded-md border bg-white px-2 py-1'>
-									<span className='mr-2 text-[11px] text-muted-foreground'>
-										{t(
-											'settings.commission_item.driver_to_driver',
-											'Driver order',
-										)}
-									</span>
-									<Switch
-										checked={newCommissionItem.driver_to_driver_commission}
-										onCheckedChange={(checked) =>
-											setNewCommissionItem((prev) => ({
-												...prev,
-												driver_to_driver_commission: checked,
-											}))
-										}
-									/>
-								</div>
-								<Button
-									type='button'
-									size='sm'
-									onClick={addCommissionItem}
-									disabled={isCommissionItemBusy('create')}
-								>
-									{isCommissionItemBusy('create') ?
-										t('common.saving', 'Saving...')
-									:	t('settings.commission_item.add', 'Add')}
-								</Button>
-							</div>
-
-							{newCommissionItem.commission_type === 'fare_range' ?
-								<div className='rounded-md border border-slate-200 bg-white'>
-									<button
-										type='button'
-										className='flex w-full items-center justify-between px-3 py-2 text-left text-sm font-medium text-slate-800 hover:bg-slate-50'
-										onClick={() => setNewCommissionRangesOpen((prev) => !prev)}
-									>
-										<span>
-											{t(
-												'settings.commission_item.range_settings',
-												'Fare Range Settings',
-											)}
-										</span>
-										{newCommissionRangesOpen ?
-											<ChevronDown className='h-4 w-4 text-slate-500' />
-										:	<ChevronRight className='h-4 w-4 text-slate-500' />}
-									</button>
-									{newCommissionRangesOpen ?
-										<div className='space-y-2 border-t border-slate-200 p-3'>
-											<div className='flex flex-wrap gap-2 justify-end'>
-												<Button
-													type='button'
-													variant='outline'
-													size='sm'
-													onClick={applyDefaultNewCommissionRanges}
-												>
-													{t('settings.use_default', 'Use Default')}
-												</Button>
-												<Button
-													type='button'
-													variant='outline'
-													size='sm'
-													onClick={addNewCommissionRangeRow}
-												>
-													<Plus className='mr-1 h-4 w-4' />
-													{t('settings.add_range', 'Add Range')}
-												</Button>
-											</div>
-											{newCommissionRangesForm.map((row, idx) => (
-												<div
-													key={row.id}
-													className='grid grid-cols-1 gap-2 rounded-md border border-slate-200 bg-slate-50 p-3 md:grid-cols-[1fr_1fr_1fr_auto]'
-												>
-													<Input
-														type='number'
-														step='0.01'
-														placeholder={t(
-															'settings.range.from_fare',
-															'From fare',
-														)}
-														value={row.from_fare}
-														onChange={(e) =>
-															updateNewCommissionRangeRow(idx, {
-																from_fare: e.target.value,
-															})
-														}
-													/>
-													<Input
-														type='number'
-														step='0.01'
-														placeholder={t(
-															'settings.range.to_fare_open',
-															'To fare (empty = open ended)',
-														)}
-														value={row.to_fare}
-														onChange={(e) =>
-															updateNewCommissionRangeRow(idx, {
-																to_fare: e.target.value,
-															})
-														}
-													/>
-													<Input
-														type='number'
-														step='0.01'
-														placeholder={t(
-															'settings.range.commission_amount',
-															'Commission amount',
-														)}
-														value={row.commission_amount}
-														onChange={(e) =>
-															updateNewCommissionRangeRow(idx, {
-																commission_amount: e.target.value,
-															})
-														}
-													/>
-													<Button
-														type='button'
-														variant='ghost'
-														size='icon'
-														title={t('settings.delete_range', 'Delete range')}
-														onClick={() => removeNewCommissionRangeRow(idx)}
-													>
-														<Trash2 className='h-4 w-4 text-red-500' />
-													</Button>
-												</div>
-											))}
-										</div>
-									:	null}
-								</div>
-							:	null}
-
-							{commissionItemsLoading ?
-								<div className='rounded-md border border-slate-200 bg-white px-3 py-3 text-sm text-muted-foreground'>
-									{t('common.loading', 'Loading...')}
-								</div>
-							:	null}
-
-							{commissionItems.map((item) => (
-								<div
-									key={item.id}
-									className={`rounded-md border p-3 space-y-2 ${
-										item.is_default ?
-											'border-blue-300 bg-blue-50/40 dark:border-blue-600 dark:bg-blue-600/40'
-										:	'border-slate-200 bg-white'
-									}`}
-								>
-									<div className='grid grid-cols-1 gap-2 md:grid-cols-[1.4fr_1.8fr_1fr_1fr_auto]'>
-										<Input
-											value={item.name}
-											onChange={(e) =>
-												updateCommissionItemRow(item.id, {
-													name: e.target.value,
-												})
-											}
-										/>
-										<Input
-											value={item.description}
-											onChange={(e) =>
-												updateCommissionItemRow(item.id, {
-													description: e.target.value,
-												})
-											}
-										/>
-										<Select
-											value={item.commission_type}
-											onValueChange={(value: 'percentage' | 'fare_range') => {
-												updateCommissionItemRow(item.id, {
-													commission_type: value,
-												});
-												if (value !== 'fare_range') {
-													setCommissionItemRangesOpenById((prev) => ({
-														...prev,
-														[item.id]: false,
-													}));
-												}
-											}}
-										>
-											<SelectTrigger>
-												<SelectValue />
-											</SelectTrigger>
-											<SelectContent>
-												<SelectItem value='percentage'>
-													{t('settings.percentage', 'Percentage')}
-												</SelectItem>
-												<SelectItem value='fare_range'>
-													{t('settings.fare_range_fixed', 'Fare Range Fixed')}
-												</SelectItem>
-											</SelectContent>
-										</Select>
-										{item.commission_type === 'percentage' ?
-											<Input
-												type='number'
-												step='0.01'
-												value={item.commission_rate}
-												onChange={(e) =>
-													updateCommissionItemRow(item.id, {
-														commission_rate: e.target.value,
-													})
-												}
-											/>
-										:	<div className='rounded-md border bg-slate-50 px-2 py-2 text-xs text-muted-foreground'>
-												{t(
-													'settings.commission_item.set_ranges',
-													'Set fare ranges below',
-												)}
-											</div>
-										}
-										<div className='flex items-center justify-end gap-1'>
-											{!item.is_default ?
-												<Button
-													type='button'
-													variant='outline'
-													size='sm'
-													onClick={() => setCommissionItemAsDefault(item.id)}
-													disabled={isCommissionItemBusy('default', item.id)}
-												>
-													{isCommissionItemBusy('default', item.id) ?
-														t('common.saving', 'Saving...')
-													:	t(
-															'settings.commission_item.set_default',
-															'Set Default',
-														)
-													}
-												</Button>
-											:	<span className='rounded-full border border-blue-300 bg-blue-100 px-2 py-1 text-[11px] font-medium text-blue-700'>
-													{t('settings.commission_item.default', 'Default')}
-												</span>
-											}
-											<div className='flex items-center gap-1 rounded-md border bg-white px-2 py-1'>
-												<span className='text-xs text-muted-foreground'>
-													{t('settings.commission_item.active', 'Active')}
-												</span>
-												<Switch
-													checked={item.is_active}
-													onCheckedChange={(checked) =>
-														updateCommissionItemRow(item.id, {
-															is_active: checked,
-														})
-													}
-												/>
-											</div>
-											<div className='flex items-center gap-1 rounded-md border bg-white px-2 py-1'>
-												<span className='text-xs text-muted-foreground'>
-													{t(
-														'settings.commission_item.driver_to_driver',
-														'Driver order',
-													)}
-												</span>
-												<Switch
-													checked={item.driver_to_driver_commission}
-													onCheckedChange={(checked) =>
-														updateCommissionItemRow(item.id, {
-															driver_to_driver_commission: checked,
-														})
-													}
-												/>
-											</div>
-											<Button
-												type='button'
-												size='sm'
-												onClick={() => saveCommissionItemRow(item)}
-												disabled={isCommissionItemBusy('save', item.id)}
-											>
-												{isCommissionItemBusy('save', item.id) ?
-													t('common.saving', 'Saving...')
-												:	t('common.save', 'Save')}
-											</Button>
-											<Button
-												type='button'
-												variant='ghost'
-												size='icon'
-												onClick={() => deleteCommissionItem(item.id)}
-												disabled={isCommissionItemBusy('delete', item.id)}
-												title={t('common.delete', 'Delete')}
-											>
-												<Trash2 className='h-4 w-4 text-red-500' />
-											</Button>
-										</div>
-									</div>
-
-									{item.commission_type === 'fare_range' ?
-										<div className='rounded-md border border-slate-200 bg-white'>
-											<button
-												type='button'
-												className='flex w-full items-center justify-between px-3 py-2 text-left text-sm font-medium text-slate-800 hover:bg-slate-50'
-												onClick={() => toggleCommissionItemRangesOpen(item.id)}
-											>
-												<span>
-													{t(
-														'settings.commission_item.range_settings',
-														'Fare Range Settings',
-													)}
-												</span>
-												{isCommissionItemRangesOpen(item.id) ?
-													<ChevronDown className='h-4 w-4 text-slate-500' />
-												:	<ChevronRight className='h-4 w-4 text-slate-500' />}
-											</button>
-											{isCommissionItemRangesOpen(item.id) ?
-												<div className='space-y-2 border-t border-slate-200 p-3'>
-													<div className='flex flex-wrap gap-2 justify-end'>
-														<Button
-															type='button'
-															variant='outline'
-															size='sm'
-															onClick={() =>
-																applyDefaultCommissionItemRanges(item.id)
-															}
-														>
-															{t('settings.use_default', 'Use Default')}
-														</Button>
-														<Button
-															type='button'
-															variant='outline'
-															size='sm'
-															onClick={() => addCommissionItemRangeRow(item.id)}
-														>
-															<Plus className='mr-1 h-4 w-4' />
-															{t('settings.add_range', 'Add Range')}
-														</Button>
-													</div>
-													{(item.commission_ranges || []).map((row, idx) => (
-														<div
-															key={row.id}
-															className='grid grid-cols-1 gap-2 rounded-md border border-slate-200 bg-slate-50 p-3 md:grid-cols-[1fr_1fr_1fr_auto]'
-														>
-															<Input
-																type='number'
-																step='0.01'
-																placeholder={t(
-																	'settings.range.from_fare',
-																	'From fare',
-																)}
-																value={row.from_fare}
-																onChange={(e) =>
-																	updateCommissionItemRangeRow(item.id, idx, {
-																		from_fare: e.target.value,
-																	})
-																}
-															/>
-															<Input
-																type='number'
-																step='0.01'
-																placeholder={t(
-																	'settings.range.to_fare_open',
-																	'To fare (empty = open ended)',
-																)}
-																value={row.to_fare}
-																onChange={(e) =>
-																	updateCommissionItemRangeRow(item.id, idx, {
-																		to_fare: e.target.value,
-																	})
-																}
-															/>
-															<Input
-																type='number'
-																step='0.01'
-																placeholder={t(
-																	'settings.range.commission_amount',
-																	'Commission amount',
-																)}
-																value={row.commission_amount}
-																onChange={(e) =>
-																	updateCommissionItemRangeRow(item.id, idx, {
-																		commission_amount: e.target.value,
-																	})
-																}
-															/>
-															<Button
-																type='button'
-																variant='ghost'
-																size='icon'
-																title={t(
-																	'settings.delete_range',
-																	'Delete range',
-																)}
-																onClick={() =>
-																	removeCommissionItemRangeRow(item.id, idx)
-																}
-															>
-																<Trash2 className='h-4 w-4 text-red-500' />
-															</Button>
-														</div>
-													))}
-												</div>
-											:	null}
-										</div>
-									:	null}
-
-									<div className='text-[11px] text-muted-foreground'>
-										{t(
-											'settings.commission_item.assigned_drivers',
-											'Assigned drivers',
-										)}
-										: {item.assigned_driver_count}
-										{item.driver_to_driver_commission ?
-											<span className='ml-2 rounded-full border border-indigo-300 bg-indigo-50 px-2 py-0.5 text-[10px] font-medium text-indigo-700'>
-												{t(
-													'settings.commission_item.driver_to_driver_tag',
-													'Driver Order Plan',
-												)}
-											</span>
-										:	null}
-									</div>
-								</div>
-							))}
-						</CardContent>
-					</Card>
-
-					<Card>
-						<CardHeader>
-							<CardTitle className='text-base'>
-								{t('settings.fare_base_interval', 'Fare Base By Time Interval')}
-							</CardTitle>
-						</CardHeader>
-						<CardContent className='space-y-3'>
-							<div className='flex flex-wrap gap-2 justify-end'>
-								<Button
-									type='button'
-									variant='outline'
-									size='sm'
-									onClick={applyDefaultScheduleToAllDays}
-								>
-									{t('settings.use_default_all_days', 'Use Default (All Days)')}
-								</Button>
-								<Button
-									type='button'
-									variant='outline'
-									size='sm'
-									onClick={() => copyDayToAllDays(activeScheduleDay)}
-								>
-									{DAY_LABELS[activeScheduleDay]}{' '}
-									{t('settings.copy_day_to_all', 'Copy to All')}
-								</Button>
-							</div>
-							<div className='flex flex-wrap gap-2'>
-								{DAY_KEYS.map((day) => (
-									<button
-										key={day}
-										type='button'
-										className={`rounded-md border px-3 py-1.5 text-xs font-medium transition ${activeScheduleDay === day ? 'border-[#1E3A5F] bg-[#1E3A5F] text-white' : 'border-slate-300 bg-white text-slate-700 hover:bg-slate-50'}`}
-										onClick={() => setActiveScheduleDay(day)}
-									>
-										{DAY_LABELS[day]}
-									</button>
-								))}
-							</div>
-							{(fareBaseScheduleForm[activeScheduleDay] || []).map(
-								(row, idx) => (
-									<div
-										key={row.id}
-										className='grid grid-cols-1 gap-2 rounded-md border border-slate-200 bg-slate-50 p-3 md:grid-cols-[1.3fr_1fr_1fr_1fr_auto]'
-									>
-										<Input
-											value={row.name}
-											placeholder={t('settings.interval_name', 'Interval name')}
-											onChange={(e) =>
-												updateScheduleRow(activeScheduleDay, idx, {
-													name: e.target.value,
-												})
-											}
-										/>
-										<Input
-											type='time'
-											value={row.start}
-											onChange={(e) =>
-												updateScheduleRow(activeScheduleDay, idx, {
-													start: e.target.value,
-												})
-											}
-										/>
-										<Input
-											type='time'
-											value={row.end}
-											onChange={(e) =>
-												updateScheduleRow(activeScheduleDay, idx, {
-													end: e.target.value,
-												})
-											}
-										/>
-										<Input
-											type='number'
-											step='0.01'
-											value={row.fare_base}
-											onChange={(e) =>
-												updateScheduleRow(activeScheduleDay, idx, {
-													fare_base: e.target.value,
-												})
-											}
-										/>
-										<Button
-											type='button'
-											variant='ghost'
-											size='icon'
-											title={t('settings.delete_interval', 'Delete interval')}
-											onClick={() => removeScheduleRow(activeScheduleDay, idx)}
-										>
-											<Trash2 className='h-4 w-4 text-red-500' />
-										</Button>
-									</div>
-								),
-							)}
-							<div className='flex flex-wrap justify-end gap-2'>
-								<Button
-									type='button'
-									variant='outline'
-									size='sm'
-									onClick={() => addScheduleRow(activeScheduleDay)}
-								>
-									<Plus className='mr-1 h-4 w-4' />
-									{t('settings.add_interval', 'Add Interval')}
-								</Button>
-								<Button
-									type='button'
-									size='sm'
-									onClick={saveFareBaseSchedule}
-									disabled={isSaving('fare_base_schedule')}
-								>
-									{isSaving('fare_base_schedule') ?
-										t('common.saving', 'Saving...')
-									:	t('settings.save_base_schedule', 'Save Base Schedule')}
-								</Button>
-							</div>
-						</CardContent>
-					</Card>
-
-					<Card>
-						<CardHeader>
-							<CardTitle className='text-base'>
-								{t(
-									'settings.fare_per_km_interval',
-									'Fare Per KM By Time Interval',
-								)}
-							</CardTitle>
-						</CardHeader>
-						<CardContent className='space-y-3'>
-							<div className='flex flex-wrap gap-2 justify-end'>
-								<Button
-									type='button'
-									variant='outline'
-									size='sm'
-									onClick={applyDefaultPerKmScheduleToAllDays}
-								>
-									{t('settings.use_default_all_days', 'Use Default (All Days)')}
-								</Button>
-								<Button
-									type='button'
-									variant='outline'
-									size='sm'
-									onClick={() => copyPerKmDayToAllDays(activeScheduleDay)}
-								>
-									{DAY_LABELS[activeScheduleDay]}{' '}
-									{t('settings.copy_day_to_all', 'Copy to All')}
-								</Button>
-							</div>
-							<div className='flex flex-wrap gap-2'>
-								{DAY_KEYS.map((day) => (
-									<button
-										key={`perkm-${day}`}
-										type='button'
-										className={`rounded-md border px-3 py-1.5 text-xs font-medium transition ${activeScheduleDay === day ? 'border-[#1E3A5F] bg-[#1E3A5F] text-white' : 'border-slate-300 bg-white text-slate-700 hover:bg-slate-50'}`}
-										onClick={() => setActiveScheduleDay(day)}
-									>
-										{DAY_LABELS[day]}
-									</button>
-								))}
-							</div>
-							{(farePerKmScheduleForm[activeScheduleDay] || []).map(
-								(row, idx) => (
-									<div
-										key={row.id}
-										className='grid grid-cols-1 gap-2 rounded-md border border-slate-200 bg-slate-50 p-3 md:grid-cols-[1.3fr_1fr_1fr_1fr_auto]'
-									>
-										<Input
-											value={row.name}
-											placeholder={t('settings.interval_name', 'Interval name')}
-											onChange={(e) =>
-												updatePerKmScheduleRow(activeScheduleDay, idx, {
-													name: e.target.value,
-												})
-											}
-										/>
-										<Input
-											type='time'
-											value={row.start}
-											onChange={(e) =>
-												updatePerKmScheduleRow(activeScheduleDay, idx, {
-													start: e.target.value,
-												})
-											}
-										/>
-										<Input
-											type='time'
-											value={row.end}
-											onChange={(e) =>
-												updatePerKmScheduleRow(activeScheduleDay, idx, {
-													end: e.target.value,
-												})
-											}
-										/>
-										<Input
-											type='number'
-											step='0.01'
-											value={row.fare_per_km}
-											onChange={(e) =>
-												updatePerKmScheduleRow(activeScheduleDay, idx, {
-													fare_per_km: e.target.value,
-												})
-											}
-										/>
-										<Button
-											type='button'
-											variant='ghost'
-											size='icon'
-											title={t('settings.delete_interval', 'Delete interval')}
-											onClick={() =>
-												removePerKmScheduleRow(activeScheduleDay, idx)
-											}
-										>
-											<Trash2 className='h-4 w-4 text-red-500' />
-										</Button>
-									</div>
-								),
-							)}
-							<div className='flex flex-wrap justify-end gap-2'>
-								<Button
-									type='button'
-									variant='outline'
-									size='sm'
-									onClick={() => addPerKmScheduleRow(activeScheduleDay)}
-								>
-									<Plus className='mr-1 h-4 w-4' />
-									{t('settings.add_interval', 'Add Interval')}
-								</Button>
-								<Button
-									type='button'
-									size='sm'
-									onClick={saveFarePerKmSchedule}
-									disabled={isSaving('fare_per_km_schedule')}
-								>
-									{isSaving('fare_per_km_schedule') ?
-										t('common.saving', 'Saving...')
-									:	t('settings.save_per_km_schedule', 'Save Per-KM Schedule')}
-								</Button>
-							</div>
-						</CardContent>
-					</Card>
-
-					<div className='flex justify-end gap-2'>
-						<Button
-							variant='outline'
-							onClick={loadSettings}
-						>
-							{t('settings.reload_all', 'Reload All')}
-						</Button>
-					</div>
-				</>
-			}
-		</div>
+	console.log(
+		`[PR-Service] Review posted — ${verdict === 'pass' ? 'APPROVE' : 'REQUEST_CHANGES'}, ${comments.length} inline comment(s)`,
 	);
 }
 
-function SettingField({
-	label,
-	keyLabel,
-	description,
-	value,
-	onChange,
-	type = 'text',
-	step,
-}: {
-	label: string;
-	keyLabel?: string;
-	description: string;
-	value: string;
-	onChange: (value: string) => void;
-	type?: string;
-	step?: string;
+// ─── Stage 5: Auto-label ──────────────────────────────────────────────────────
+
+async function autoLabel(repo, prNumber, issues, verdict, token) {
+	const labels = [...new Set(issues.map((i) => i.category))];
+	if (verdict === 'fail') labels.push('blocked');
+	else if (verdict === 'pass') labels.push('auto-approved');
+	else labels.push('needs-review');
+
+	await githubRequest(
+		`https://api.github.com/repos/${repo}/issues/${prNumber}/labels`,
+		'POST',
+		{ labels },
+		token,
+	);
+	console.log(`[PR-Service] Labels applied: ${labels.join(', ')}`);
+}
+
+// ─── Stage 6: Set commit status ──────────────────────────────────────────────
+
+async function setCommitStatus(repo, sha, verdict, description, token) {
+	const stateMap = {
+		pending: 'pending',
+		pass: 'success',
+		warn: 'success',
+		fail: 'failure',
+	};
+
+	// GitHub status API rejects 4-byte Unicode (emojis) in description
+	const safeDescription = description
+		.replace(/[\u{1F000}-\u{1FFFF}]/gu, '') // remove 4-byte emoji blocks
+		.replace(/[\u{20000}-\u{10FFFF}]/gu, '') // remove supplementary planes
+		.replace(/⏳|✅|❌|⚡|🔄/g, '') // remove common 3-byte emoji too
+		.trim()
+		.slice(0, 140);
+
+	await githubRequest(
+		`https://api.github.com/repos/${repo}/statuses/${sha}`,
+		'POST',
+		{
+			state: stateMap[verdict] ?? 'error',
+			description: safeDescription,
+			context: 'repo-intel-pr-checker',
+		},
+		token,
+	);
+	console.log(
+		`[PR-Service] Status → ${stateMap[verdict] ?? 'error'}: ${description}`,
+	);
+}
+// ─── Stage 7: Auto-close or auto-merge ───────────────────────────────────────
+
+async function autoClosePR(repo, prNumber, sha, token) {
+	try {
+		await githubRequest(
+			`https://api.github.com/repos/${repo}/issues/${prNumber}/comments`,
+			'POST',
+			{
+				body: [
+					'## 🚨 Merge Blocked by Automated PR Checker',
+					'',
+					'One or more **critical** issues were found in this PR.',
+					'Please fix all 🔴 critical issues, push a new commit, then comment `/recheck` to re-run the analysis.',
+					'',
+					'_This PR cannot be merged until all critical issues are resolved._',
+				].join('\n'),
+			},
+			token,
+		);
+		console.log(`[PR-Service] Block comment posted on PR #${prNumber}`);
+	} catch (err) {
+		console.warn(`[PR-Service] autoClosePR comment failed: ${err.message}`);
+	}
+}
+
+async function autoMergePR(repo, prNumber, token) {
+	try {
+		await githubRequest(
+			`https://api.github.com/repos/${repo}/pulls/${prNumber}/merge`,
+			'PUT',
+			{
+				merge_method: 'squash',
+				commit_title: `Auto-merged: PR #${prNumber} passed all checks ✅`,
+			},
+			token,
+		);
+		console.log(`[PR-Service] PR #${prNumber} auto-merged`);
+	} catch (err) {
+		console.warn(`[PR-Service] Auto-merge skipped: ${err.message}`);
+	}
+}
+
+// ─── Idempotency guard ────────────────────────────────────────────────────────
+
+async function idempotencyFunc(sha) {
+	const key = `pr:posted:${sha}`;
+	const set = await redis.set(key, '1', 'EX', CACHE_TTL_S, 'NX');
+	if (!set) {
+		console.log(
+			`[PR-Service] Idempotency guard: already posted for sha=${sha.slice(0, 7)}, skipping`,
+		);
+		return false;
+	}
+	return true;
+}
+
+// ─── Core analysis logic ──────────────────────────────────────────────────────
+
+async function runAnalysis({
+	pr,
+	repo,
+	sha,
+	prNum,
+	token,
+	repoRoot,
+	isRecheck = false,
 }) {
-	return (
-		<div className='rounded-md border bg-white px-3 py-2 space-y-1'>
-			<div className='space-y-0.5'>
-				<div className='text-sm font-semibold text-slate-700'>{label}</div>
-				{keyLabel ?
-					<div className='text-[11px] font-mono tracking-wide text-slate-400'>
-						{keyLabel}
-					</div>
-				:	null}
-			</div>
-			<Input
-				type={type}
-				step={step}
-				value={value}
-				onChange={(e) => onChange(e.target.value)}
-			/>
-			<div className='text-xs text-muted-foreground leading-relaxed'>
-				{description}
-			</div>
-		</div>
+	console.log(
+		`\n[PR-Service] ── Analysing PR #${prNum} (${repo}) sha=${sha.slice(0, 7)} ──`,
 	);
+
+	// Step 0: Block merge button immediately
+	await setCommitStatus(
+		repo,
+		sha,
+		'pending',
+		'⏳ Checking PR — do not merge yet…',
+		token,
+	);
+
+	// Step 1: Rate limit check
+	const allowed = await checkRateLimit(repo);
+	if (!allowed) {
+		await setCommitStatus(
+			repo,
+			sha,
+			'fail',
+			'❌ Rate limit reached — try again later',
+			token,
+		);
+		return;
+	}
+
+	// Step 1.5: Check Redis cache BEFORE fetching the diff.
+	// Issues + findings are already stored in cacheSet — no extra Redis cost.
+	// Use idempotency guard to decide how much to replay:
+	//   · First time we see this SHA (or after a Redis restart) → post full review
+	//   · Already posted before                                 → just restore status
+	if (!isRecheck) {
+		const quickPatterns = getPatternsForDiff('');
+		const cached = await cacheGet(sha, quickPatterns);
+		if (cached) {
+			const { verdict, summary, issues, findings } = cached;
+			console.log(
+				`[PR-Service] Cache hit sha=${sha.slice(0, 7)} — verdict=${verdict}, issues=${issues.length}`,
+			);
+
+			// Always restore the commit status immediately
+			await setCommitStatus(repo, sha, verdict, summary, token);
+
+			// Re-post review + labels only if the idempotency key is gone
+			// (i.e. first time we're showing results for this SHA)
+			const shouldPost = await idempotencyFunc(sha);
+			if (shouldPost && (issues.length > 0 || findings.length > 0)) {
+				console.log(
+					`[PR-Service] Re-posting cached review for sha=${sha.slice(0, 7)}`,
+				);
+				await Promise.all([
+					postReview(repo, prNum, sha, issues, findings, verdict, token, []),
+					autoLabel(repo, prNum, issues, verdict, token),
+				]);
+				if (verdict === 'fail') await autoClosePR(repo, prNum, sha, token);
+			} else {
+				console.log(
+					`[PR-Service] Review already posted for sha=${sha.slice(0, 7)} — status restored only`,
+				);
+			}
+
+			return { verdict, issues, findings };
+		}
+	}
+
+	if (isRecheck) {
+		await dismissPreviousReviews(repo, prNum, token);
+		await setCommitStatus(repo, sha, 'pending', '🔄 Re-check in progress…', token);
+	}
+
+	// Step 2: Fetch + strip diff
+	let diff;
+	try {
+		await setCommitStatus(repo, sha, 'pending', '⏳ Fetching diff…', token);
+		const rawDiff = await getDiff(pr.diff_url, token);
+		diff = stripNoisyFiles(rawDiff);
+		console.log(
+			`[PR-Service] Diff: ${rawDiff.length} chars raw → ${diff.length} chars after stripping`,
+		);
+
+		if (!diff.trim()) {
+			console.log(
+				'[PR-Service] Diff is empty after stripping — skipping analysis',
+			);
+			const verdict = 'pass';
+			const summary =
+				'✅ No reviewable changes detected (diff contained only generated/lock files)';
+			await Promise.all([
+				postReview(repo, prNum, sha, [], [], verdict, token),
+				autoLabel(repo, prNum, [], verdict, token),
+				setCommitStatus(repo, sha, verdict, summary, token),
+			]);
+			await autoMergePR(repo, prNum, token);
+			return { verdict, issues: [] };
+		}
+	} catch (err) {
+		console.error('[PR-Service] Diff fetch failed:', err.message);
+		await setCommitStatus(
+			repo,
+			sha,
+			'fail',
+			'❌ Could not fetch PR diff',
+			token,
+		);
+		return;
+	}
+
+	// Step 3: Resolve live patterns for this diff's language
+	const allPatterns = getPatternsForDiff(diff);
+
+	// Step 5: Regex pre-scan (free)
+	await setCommitStatus(
+		repo,
+		sha,
+		'pending',
+		'⏳ Scanning for issue patterns…',
+		token,
+	);
+
+	let issues = [];
+	const hasSignals = cheapPreScan(diff, allPatterns);
+
+	if (!hasSignals) {
+		console.log('[PR-Service] Pre-scan clean → no issues found');
+	} else {
+		// Step 5b: Keyword pre-filter
+		const patterns = filterPatternsByKeyword(diff, allPatterns);
+
+		if (patterns.length === 0) {
+			console.log(
+				'[PR-Service] All patterns filtered by keyword pre-filter → no issues',
+			);
+		} else {
+			// Direct regex match (Voyage disabled)
+			issues = patterns
+				.filter((p) => p.regex?.test(diff))
+				.map((p) => ({ ...p, score: 1.0 }));
+			console.log(`[PR-Service] Regex matched ${issues.length} issue(s)`);
+		}
+	}
+
+	// Step 6: Map issues to exact diff line positions
+	await setCommitStatus(
+		repo,
+		sha,
+		'pending',
+		'⏳ Mapping issues to diff lines…',
+		token,
+	);
+	const findings = findDiffPositions(diff, issues);
+	console.log(`[PR-Service] Inline comment targets: ${findings.length}`);
+
+	// Step 7: Build verdict
+	const verdict =
+		issues.some((i) => i.severity === 'critical') ? 'fail'
+		: issues.some((i) => i.severity === 'warning') ? 'warn'
+		: 'pass';
+
+	const summary =
+		issues.length === 0 ? '✅ No issues detected — clean diff'
+		: verdict === 'fail' ?
+			`❌ ${issues.filter((i) => i.severity === 'critical').length} critical issue(s) found — merge blocked`
+		:	`⚠️ ${issues.length} warning(s) found — review before merging`;
+
+	console.log(`[PR-Service] Verdict: ${verdict}`);
+
+	// Step 8: Cache result
+	await cacheSet(sha, { issues, findings, verdict, summary });
+
+	// Step 9: Idempotency guard
+	const shouldProceed = await idempotencyFunc(sha);
+	if (!shouldProceed) return;
+
+	// ── STEP 10: FIX ALL — FIRST, before any GitHub call ─────────────────────
+	//
+	// applyAllFixes() writes every fix to disk RIGHT NOW.
+	// By the time postReview() / autoLabel() / setCommitStatus() fire below,
+	// the repo is already patched. The review comment will say "auto-fix applied"
+	// and the developer sees a clean file when they open it.
+	//
+	await setCommitStatus(
+		repo,
+		sha,
+		'pending',
+		'⚡ Applying fixes to disk…',
+		token,
+	);
+	const fixResults = await applyAllFixes(
+		findings,
+		repoRoot ?? DEFAULT_REPO_ROOT,
+	);
+
+	// Step 11: Post review, labels, and final status in parallel
+	try {
+		await Promise.all([
+			postReview(
+				repo,
+				prNum,
+				sha,
+				issues,
+				findings,
+				verdict,
+				token,
+				fixResults,
+			),
+			autoLabel(repo, prNum, issues, verdict, token),
+			setCommitStatus(repo, sha, verdict, summary, token),
+		]);
+
+		if (verdict === 'fail') await autoClosePR(repo, prNum, sha, token);
+		else if (verdict === 'pass') await autoMergePR(repo, prNum, token);
+		if (isRecheck) {
+			await githubRequest(
+				`https://api.github.com/repos/${repo}/issues/${prNum}/comments`,
+				'POST',
+				{
+					body: [
+						'## ✅ Re-check Complete',
+						'',
+						`**Verdict: ${
+							verdict === 'fail' ? '🔴 Blocked — critical issues found'
+							: verdict === 'warn' ? '🟡 Warnings — review before merging'
+							: '✅ Clean — no issues detected'
+						}**`,
+						'',
+						`| | |`,
+						`|---|---|`,
+						`| Issues found | ${issues.length} |`,
+						`| Critical | ${issues.filter((i) => i.severity === 'critical').length} |`,
+						`| Warnings | ${issues.filter((i) => i.severity === 'warning').length} |`,
+						'',
+						verdict === 'fail' ?
+							'> Fix all 🔴 critical issues, push a new commit, then comment `/recheck` again.'
+						: verdict === 'warn' ?
+							'> Review the warnings above and push a fix if needed.'
+						:	'> All checks passed — this PR is ready to merge 🎉',
+					].join('\n'),
+				},
+				token,
+			).catch((err) =>
+				console.warn(
+					`[PR-Service] Could not post recheck-done comment: ${err.message}`,
+				),
+			);
+		}
+
+		console.log(`[PR-Service] ── Done PR #${prNum} — ${verdict} ──\n`);
+	} catch (err) {
+		console.error('[PR-Service] Failed to post results:', err.message);
+	}
+
+	return { verdict, issues, fixResults };
 }
+
+// ─── In-process async runner (replaces BullMQ) ───────────────────────────────
+// Jobs run directly in the background — no Redis queue needed.
+// A simple in-flight set prevents duplicate runs for the same SHA.
+
+const _inFlight = new Set();
+
+async function enqueueAnalysis({ pr, repo, sha, prNum, token, repoRoot, isRecheck }) {
+	const jobKey = isRecheck
+		? `${repo}__${sha}__recheck_${Date.now()}`
+		: `${repo}__${sha}`;
+
+	if (_inFlight.has(jobKey)) {
+		console.log(`[PR-Service] Already running job for ${jobKey} — skipping duplicate`);
+		return;
+	}
+
+	_inFlight.add(jobKey);
+	console.log(`[PR-Service] PR #${prNum} starting analysis (key: ${jobKey})`);
+
+	// Fire-and-forget — non-blocking so the webhook 200 returns immediately
+	runAnalysis({ pr, repo, sha, prNum, token, repoRoot, isRecheck })
+		.catch((err) => console.error(`[PR-Service] Analysis error for ${jobKey}:`, err.message))
+		.finally(() => _inFlight.delete(jobKey));
+}
+
+// ─── Public API ───────────────────────────────────────────────────────────────
+
+/**
+ * analyzePR — queues a PR for full analysis + auto-fix.
+ *
+ * Pass repoRoot so applyAllFixes knows where the checkout lives on disk.
+ *
+ *   await analyzePR(webhookPayload, { repoRoot: '/workspace/my-repo' });
+ */
+exports.analyzePR = async (payload, options = {}) => {
+	const token = process.env.GITHUB_TOKEN;
+	const pr = payload.pull_request;
+	const repo = payload.repository.full_name;
+	const sha = pr.head.sha;
+	const prNum = pr.number;
+	const repoRoot = options.repoRoot ?? DEFAULT_REPO_ROOT;
+	const isRecheck = options.isRecheck ?? false;
+
+	enqueueAnalysis({ pr, repo, sha, prNum, token, repoRoot, isRecheck });
+};
+/**
+ * applyAllFixes — exported for direct use from a REST route or CLI.
+ *
+ * Applies every buildFix() result from cached findings to files on disk.
+ * No AI, no network — pure fs read/write. All files patched in parallel.
+ *
+ * POST /fix-all
+ *   Body : { sha: string, repoRoot: string }
+ *   Reply: { results: [{ path, position, original, fixed, applied, error }] }
+ *
+ * Express example:
+ *
+ *   const { applyAllFixes } = require('./pr_service');
+ *
+ *   app.post('/fix-all', async (req, res) => {
+ *     const { sha, repoRoot } = req.body;
+ *     const cached = await cacheGet(sha, getPatternsForDiff(''));
+ *     if (!cached) return res.status(404).json({ error: 'No cached result for SHA' });
+ *     const results = await applyAllFixes(cached.findings, repoRoot);
+ *     res.json({ results });
+ *   });
+ */
+exports.applyAllFixes = applyAllFixes;
+
+// ─── Webhook handler ──────────────────────────────────────────────────────────
+
+// ─── Webhook handler ──────────────────────────────────────────────────────────
+
+async function cacheDelete(sha) {
+	await redis.del(`pr:result:${sha}`);
+	await redis.del(`pr:posted:${sha}`);
+	console.log(`[PR-Service] Cache cleared for sha=${sha.slice(0, 7)}`);
+}
+
+// Bot comments that should never trigger commands — prevents feedback loops.
+// IMPORTANT: entries must match the EXACT first line each bot comment posts
+// (including any leading emoji) so startsWith() catches them reliably.
+const BOT_COMMENT_PREFIXES = [
+	'## Re-check Started',
+	'## Re-check Queued',
+	'## Re-check Failed',
+	'## Re-check Complete',
+	'## Fix-All Started',
+	'## Fix-All Complete',
+	'## Fix-All Failed',
+	'## 🚨 Merge Blocked',   // autoClosePR posts this exact heading
+	'## Merge Blocked',          // fallback without emoji
+	'## ✅ Re-check Complete',    // alternate emoji variant
+];
+
+// Commands must appear on their own line (not embedded in prose).
+// e.g.  "then comment `/recheck` again"  must NOT trigger a recheck.
+const CMD_RECHECK = /(?:^|\n)\s*\/recheck\s*(?:\n|$)/;
+const CMD_FIX_ALL = /(?:^|\n)\s*\/fix-all\s*(?:\n|$)/;
+
+exports.handleWebhook = async (event, payload) => {
+	console.log(`[PR-Service] Webhook: event=${event} action=${payload.action}`);
+
+	// ── pull_request events ───────────────────────────────────────────────────
+	if (event === 'pull_request') {
+		if (['opened', 'synchronize', 'reopened'].includes(payload.action)) {
+			// For synchronize events, fetch the actual commit message from GitHub
+			// to detect bot-authored commits. The PR webhook payload does NOT
+			// include head.commit.message — only head.sha is available.
+			if (payload.action === 'synchronize') {
+				const sha = payload.pull_request?.head?.sha;
+				const repo = payload.repository?.full_name;
+				const token = process.env.GITHUB_TOKEN;
+				try {
+					const commit = await githubRequest(
+						`https://api.github.com/repos/${repo}/git/commits/${sha}`,
+						'GET',
+						undefined,
+						token,
+					);
+					if ((commit?.message ?? '').includes('[pr-checker]')) {
+						console.log(
+							`[PR-Service] Ignoring synchronize for ${sha?.slice(0, 7)} — bot commit`,
+						);
+						return;
+					}
+				} catch (err) {
+					console.warn(
+						`[PR-Service] Could not verify commit message for ${sha?.slice(0, 7)}: ${err.message}`,
+					);
+					// Proceed with analysis if we can't verify — better to re-analyse
+					// than to silently drop a legitimate push.
+				}
+			}
+
+			return exports.analyzePR(payload);
+		}
+		return;
+	}
+
+	// ── issue_comment events ──────────────────────────────────────────────────
+	if (event === 'issue_comment' && payload.action === 'created') {
+		const body = payload.comment?.body?.trim() ?? '';
+		const prNumber = payload.issue?.number;
+		const repo = payload.repository?.full_name;
+		const token = process.env.GITHUB_TOKEN;
+		const isPR = !!payload.issue?.pull_request;
+
+		console.log(
+			`[PR-Service] Comment body: "${body.slice(0, 80)}" | isPR: ${isPR}`,
+		);
+
+		// Guard 1: must be on a PR, not a plain issue
+		if (!isPR) {
+			console.log('[PR-Service] Comment is on an issue, not a PR — ignoring');
+			return;
+		}
+
+		// Guard 2: ignore our own bot comments to prevent feedback loops
+		if (BOT_COMMENT_PREFIXES.some((prefix) => body.startsWith(prefix))) {
+			console.log('[PR-Service] Ignoring bot-generated comment — skipping');
+			return;
+		}
+
+		// Guard 3: command must be on its own line — not embedded in prose.
+		// "then comment `/recheck` again" must NOT trigger a recheck.
+		const hasRecheck = CMD_RECHECK.test(body);
+		const hasFixAll  = CMD_FIX_ALL.test(body);
+
+		if (!hasRecheck && !hasFixAll) {
+			console.log('[PR-Service] Comment did not match any command — ignoring');
+			return;
+		}
+
+		// ── /recheck ─────────────────────────────────────────────────────────────
+		if (hasRecheck) {
+			console.log(`[PR-Service] /recheck triggered on PR #${prNumber}`);
+
+			await githubRequest(
+				`https://api.github.com/repos/${repo}/issues/${prNumber}/comments`,
+				'POST',
+				{
+					body: [
+						'## Re-check Started',
+						'',
+						'> Clearing cache and re-running full analysis on the latest commit...',
+					].join('\n'),
+				},
+				token,
+			).catch((err) =>
+				console.warn(
+					`[PR-Service] Could not post recheck-start comment: ${err.message}`,
+				),
+			);
+
+			const res = await fetch(payload.issue.pull_request.url, {
+				headers: GITHUB_HEADERS(token),
+			});
+
+			if (!res.ok) {
+				await githubRequest(
+					`https://api.github.com/repos/${repo}/issues/${prNumber}/comments`,
+					'POST',
+					{
+						body: `## Re-check Failed\n\nCould not fetch PR data (HTTP ${res.status}).`,
+					},
+					token,
+				).catch(() => {});
+				return;
+			}
+
+			const pr = await res.json();
+			await cacheDelete(pr.head.sha);
+
+			try {
+				await exports.analyzePR(
+					{ pull_request: pr, repository: payload.repository },
+					{ isRecheck: true },
+				);
+
+				await githubRequest(
+					`https://api.github.com/repos/${repo}/issues/${prNumber}/comments`,
+					'POST',
+					{
+						body: [
+							'## Re-check Queued',
+							'',
+							'> Analysis is running — review comment will appear shortly.',
+						].join('\n'),
+					},
+					token,
+				).catch((err) =>
+					console.warn(
+						`[PR-Service] Could not post recheck-queued comment: ${err.message}`,
+					),
+				);
+			} catch (err) {
+				console.error(`[PR-Service] /recheck failed: ${err.message}`);
+				await githubRequest(
+					`https://api.github.com/repos/${repo}/issues/${prNumber}/comments`,
+					'POST',
+					{ body: `## Re-check Failed\n\n\`${err.message}\`` },
+					token,
+				).catch(() => {});
+			}
+
+			return;
+		}
+
+		// ── /fix-all ─────────────────────────────────────────────────────────────
+		if (hasFixAll) {
+			console.log(`[PR-Service] /fix-all triggered on PR #${prNumber}`);
+
+			await githubRequest(
+				`https://api.github.com/repos/${repo}/issues/${prNumber}/comments`,
+				'POST',
+				{
+					body: [
+						'## Fix-All Started',
+						'',
+						'> Fetching PR data and applying all auto-fixes via GitHub API...',
+					].join('\n'),
+				},
+				token,
+			).catch((err) =>
+				console.warn(
+					`[PR-Service] Could not post fix-all-start comment: ${err.message}`,
+				),
+			);
+
+			const res = await fetch(payload.issue.pull_request.url, {
+				headers: GITHUB_HEADERS(token),
+			});
+
+			if (!res.ok) {
+				await githubRequest(
+					`https://api.github.com/repos/${repo}/issues/${prNumber}/comments`,
+					'POST',
+					{
+						body: `## Fix-All Failed\n\nCould not fetch PR data (HTTP ${res.status}).`,
+					},
+					token,
+				).catch(() => {});
+				return;
+			}
+
+			const pr = await res.json();
+			const sha = pr.head.sha;
+			const branch = pr.head.ref;
+
+			console.log(
+				`[PR-Service] /fix-all — sha=${sha.slice(0, 7)} branch=${branch}`,
+			);
+
+			const cached = await cacheGet(sha, getPatternsForDiff(''));
+
+			if (!cached || !cached.findings?.length) {
+				await githubRequest(
+					`https://api.github.com/repos/${repo}/issues/${prNumber}/comments`,
+					'POST',
+					{
+						body: [
+							'## Fix-All Failed',
+							'',
+							'No cached analysis found for the latest commit.',
+							'Please comment `/recheck` first to generate findings, then `/fix-all`.',
+						].join('\n'),
+					},
+					token,
+				).catch(() => {});
+				return;
+			}
+
+			console.log(
+				`[PR-Service] /fix-all — ${cached.findings.length} finding(s) — Ollama + buildFix`,
+			);
+
+			try {
+				// Step A: Pre-fetch all unique files to extract surrounding context for Ollama.
+				// Ollama with context = project-aware fix; without = generic template.
+				const fileCache = new Map(); // filePath → { lines[], sha }
+				const uniquePaths = [...new Set(cached.findings.map((f) => f.path))];
+
+				await Promise.all(
+					uniquePaths.map(async (filePath) => {
+						try {
+							const fd  = await githubRequest(
+								`https://api.github.com/repos/${repo}/contents/${filePath}` +
+									(branch ? `?ref=${branch}` : ''),
+								'GET', undefined, token,
+							);
+							fileCache.set(filePath, {
+								lines: Buffer.from(fd.content, 'base64').toString('utf8').split('\n'),
+								sha  : fd.sha,
+							});
+						} catch { /* file fetch failed — Ollama will run without context */ }
+					}),
+				);
+
+				// Enrich each finding with surrounding code lines (5 above + 5 below).
+				// The bad line is marked with >>> so Ollama knows exactly what to fix.
+				const enrichedFindings = cached.findings.map((f) => {
+					const fc = fileCache.get(f.path);
+					if (!fc) return f;
+					const lineIdx = fc.lines.findIndex((l) => l.trim() === f.lineContent.trim());
+					if (lineIdx === -1) return f;
+					const start   = Math.max(0, lineIdx - 5);
+					const end     = Math.min(fc.lines.length - 1, lineIdx + 5);
+					const ctx     = fc.lines.slice(start, end + 1).map((l, i) =>
+						(start + i) === lineIdx ? `>>> ${l.trimStart()}` : `    ${l.trimStart()}`,
+					).join('\n');
+					return { ...f, surroundingContext: ctx };
+				});
+
+				// Step B: Generate fixes — Ollama (with context) first, buildFix() fallback
+				const fixSuggestions = await fixFindings(enrichedFindings);
+
+				const ollamaCount   = fixSuggestions.filter((r) => r.source === 'ollama').length;
+				const buildFixCount = fixSuggestions.filter((r) => r.source === 'buildFix').length;
+				const noneCount     = fixSuggestions.filter((r) => r.source === 'none').length;
+
+				// Step B: Only commit findings that have a fix
+				const fixable = cached.findings.filter((f, i) => fixSuggestions[i]?.fixed);
+				const fixableWithOverride = fixable.map((f, i) => ({
+					...f,
+					// Override buildFix to return the Ollama/pattern fix we already computed
+					issue: {
+						...f.issue,
+						buildFix: () => fixSuggestions[
+							cached.findings.indexOf(f)
+						]?.fixed ?? f.issue.buildFix(f.lineContent),
+					},
+				}));
+
+				// Step C: Commit via GitHub API
+				const commitResults = fixable.length > 0
+					? await applyAllFixes(fixableWithOverride, DEFAULT_REPO_ROOT, { repo, token, branch })
+					: [];
+
+				const committed = commitResults.filter((r) => r.applied).length;
+				const commitFailed = commitResults.filter((r) => !r.applied).length;
+
+				console.log(
+					`[PR-Service] /fix-all complete — ollama:${ollamaCount} buildFix:${buildFixCount} none:${noneCount} committed:${committed}`,
+				);
+
+				await githubRequest(
+					`https://api.github.com/repos/${repo}/issues/${prNumber}/comments`,
+					'POST',
+					{
+						body: [
+							'## Fix-All Complete',
+							'',
+							`| Engine | Fixes |`,
+							`|--------|-------|`,
+							`| 🤖 Ollama AI | ${ollamaCount} |`,
+							`| 🔧 Pattern (buildFix) | ${buildFixCount} |`,
+							`| ⚠️ No fix available | ${noneCount} |`,
+							`| ✅ Committed to branch | ${committed} |`,
+							`| ❌ Commit failed | ${commitFailed} |`,
+							'',
+							committed > 0
+								? `Fixes pushed to \`${branch}\`. Comment \`/recheck\` to verify.`
+								: 'No fixes could be committed — files may already be clean.',
+						].join('\n'),
+					},
+					token,
+				).catch(() => {});
+			} catch (err) {
+				console.error(`[PR-Service] /fix-all error: ${err.message}`);
+				await githubRequest(
+					`https://api.github.com/repos/${repo}/issues/${prNumber}/comments`,
+					'POST',
+					{ body: `## Fix-All Failed\n\n\`${err.message}\`` },
+					token,
+				).catch(() => {});
+			}
+
+			return;
+		}
+	}
+};
+/**
+ * cacheGet — exported so scripts/run-fix-all.js can load findings by SHA
+ * without duplicating the Redis + re-hydration logic.
+ */
+exports.cacheGet = cacheGet;
+
+// ─── Graceful shutdown ────────────────────────────────────────────────────────
+
+async function shutdown() {
+	console.log('[PR-Service] Shutting down…');
+	try { await redis.quit(); } catch (_) {}
+	process.exit(0);
+}
+
+process.on('SIGTERM', shutdown);
+process.on('SIGINT', shutdown);
