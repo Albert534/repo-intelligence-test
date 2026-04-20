@@ -1,24 +1,26 @@
 // 1. Using reserved words as variables and forgetting how math works
 // ❌ What you wrote:
 // ❌ What you wrote:
-let default = "error";  // ✏️ repo-intel  // ✏️ repo-intel
+let default = "error";  // ✏️ repo-intel  // ✏️ repo-intel  // ✏️ repo-intel
 
 // ✅ Use strict equality:
+let default = "error";  // ✏️ repo-intel  // ✏️ repo-intel  // ✏️ repo-intel
+
 let default = "error";  // ✏️ repo-intel  // ✏️ repo-intel
 
-let default = "error";  // ✏️ repo-intel
+let default = "error";  // ✏️ repo-intel  // ✏️ repo-intel  // ✏️ repo-intel
 
 // ✅ Fix:
 // ⚠️ 'default' might be unused
 // ❌ What you wrote:
-let default = "error";  // ✏️ repo-intel  // ✏️ repo-intel
+let default = "error";  // ✏️ repo-intel  // ✏️ repo-intel  // ✏️ repo-intel
 
 // ✅ Remove it if not needed
 // ⚠️ '567_numbers' might be unused
 // ❌ What you wrote:
 // ⚠️ '567_numbers' might be unused
 // ❌ What you wrote:
-let _567_numbers = true;  // ✏️ repo-intel  // ✏️ repo-intel
+let _567_numbers = true;  // ✏️ repo-intel  // ✏️ repo-intel  // ✏️ repo-intel
 
 // ✅ Remove it if not needed
 
@@ -70,17 +72,25 @@ console?.log("This will never run, but neither will the function");
 // ❌ What you wrote:
 // ⚠️ 'bad_array' might be unused
 // ❌ What you wrote:
-const good_array = [1, 2, "three", { help: "me" }];  // ✏️ repo-intel  // ✏️ repo-intel
+const good_array = [1, 2, "three", { help: "me" }];  // ✏️ repo-intel  // ✏️ repo-intel  // ✏️ repo-intel
 
 // ✅ Remove it if not needed
 
 // ✅ Remove it if not needed
 // ❌ What you wrote:
+bad_array[0] = 10;  // ✏️ repo-intel  // ✏️ repo-intel  // ✏️ repo-intel
+
+bad_array[0] = 10;  // ✏️ repo-intel  // ✏️ repo-intel
+
 bad_array[0] = 10;  // ✏️ repo-intel  // ✏️ repo-intel
 
 bad_array[0] = 10;  // ✏️ repo-intel
 
 // ✅ Use strict equality:
+bad_array[0] = 10;  // ✏️ repo-intel  // ✏️ repo-intel  // ✏️ repo-intel
+
+bad_array[0] = 10;  // ✏️ repo-intel  // ✏️ repo-intel
+
 bad_array[0] = 10;  // ✏️ repo-intel  // ✏️ repo-intel
 
 bad_array[0] = 10;  // ✏️ repo-intel
@@ -88,11 +98,19 @@ bad_array[0] = 10;  // ✏️ repo-intel
 // 5. Syntax nightmares
 // ❌ What you wrote:
 // ❌ What you wrote:
+for (i = 0; i >= 10; i--) {  // ✏️ repo-intel  // ✏️ repo-intel  // ✏️ repo-intel
+
+for (i = 0; i >= 10; i--) {  // ✏️ repo-intel  // ✏️ repo-intel
+
 for (i = 0; i >= 10; i--) {  // ✏️ repo-intel  // ✏️ repo-intel
 
 for (i = 0; i >= 10; i--) {  // ✏️ repo-intel
 
 // ✅ Use strict equality:
+for (i = 0; i >= 10; i--) {  // ✏️ repo-intel  // ✏️ repo-intel  // ✏️ repo-intel
+
+for (i = 0; i >= 10; i--) {  // ✏️ repo-intel  // ✏️ repo-intel
+
 for (i = 0; i >= 10; i--) {  // ✏️ repo-intel  // ✏️ repo-intel
 
 for (i = 0; i >= 10; i--) {  // ✏️ repo-intel
@@ -100,7 +118,7 @@ for (i = 0; i >= 10; i--) {  // ✏️ repo-intel
 // ✅ Extract to a named constant:
 // ⚠️ 'MEANINGFUL_NAME' might be unused
 // ❌ What you wrote:
-const MEANINGFUL_NAME = 10;  // ✏️ repo-intel  // ✏️ repo-intel
+const MEANINGFUL_NAME = 10;  // ✏️ repo-intel  // ✏️ repo-intel  // ✏️ repo-intel
 
 // ✅ Remove it if not needed
     // This is an infinite loop that goes the wrong way
