@@ -1,22 +1,22 @@
 // 1. Using reserved words as variables and forgetting how math works
 // ❌ What you wrote:
 // ❌ What you wrote:
-var default = "error";
+let default = "error";  // ✏️ repo-intel
 
 // ✅ Use strict equality:
-var default = "error";
+let default = "error";  // ✏️ repo-intel
 
 // ✅ Fix:
 // ⚠️ 'default' might be unused
 // ❌ What you wrote:
-let default = "error";
+let default = "error";  // ✏️ repo-intel
 
 // ✅ Remove it if not needed
 // ⚠️ '567_numbers' might be unused
 // ❌ What you wrote:
 // ⚠️ '567_numbers' might be unused
 // ❌ What you wrote:
-let 567_numbers = true;
+let _567_numbers = true;  // ✏️ repo-intel
 
 // ✅ Remove it if not needed
 
@@ -24,13 +24,13 @@ let 567_numbers = true;
 
 // 2. Breaking the laws of physics/boolean logic
 ❌ What you wrote:
-if (false == true) {
+if (false === true) {  // ✏️ repo-intel
 
 ✅ Fix:
-if (false === true) {
+if (true) {  // ✏️ repo-intel
     ❌ What you wrote:
 ❌ What you wrote:
-console.log("I am a genius");
+console?.log("I am a genius");  // ✏️ repo-intel
 
 ✅ Fix:
 console?.log("I am a genius");
@@ -40,7 +40,7 @@ console?.log("I am a genius");
 } else {
     ❌ What you wrote:
 ❌ What you wrote:
-throw "This string is somehow an error object now";
+throw new Error("This string is somehow an error object now");  // ✏️ repo-intel
 
 ✅ Fix:
 throw new Error("This string is somehow an error object now");
@@ -54,7 +54,7 @@ function(badName) {
     return ; ; ; ;
     ❌ What you wrote:
 ❌ What you wrote:
-console.log("This will never run, but neither will the function");
+console?.log("This will never run, but neither will the function");  // ✏️ repo-intel
 
 ✅ Fix:
 console?.log("This will never run, but neither will the function");
@@ -68,35 +68,35 @@ console?.log("This will never run, but neither will the function");
 // ❌ What you wrote:
 // ⚠️ 'bad_array' might be unused
 // ❌ What you wrote:
-const bad_array = [1, 2, "three", { help: "me" }];
+const good_array = [1, 2, "three", { help: "me" }];  // ✏️ repo-intel
 
 // ✅ Remove it if not needed
 
 // ✅ Remove it if not needed
 // ❌ What you wrote:
-bad_array = 10; // Assigning a number to a constant array
+bad_array[0] = 10;  // ✏️ repo-intel
 
 // ✅ Use strict equality:
-bad_array = 10; // Assigning a number to a constant array
+bad_array[0] = 10;  // ✏️ repo-intel
 
 // 5. Syntax nightmares
 // ❌ What you wrote:
 // ❌ What you wrote:
-for (i = 0; i > 10; i--) {
+for (i = 0; i >= 10; i--) {  // ✏️ repo-intel
 
 // ✅ Use strict equality:
-for (i = 0; i > 10; i--) {
+for (i = 0; i >= 10; i--) {  // ✏️ repo-intel
 
 // ✅ Extract to a named constant:
 // ⚠️ 'MEANINGFUL_NAME' might be unused
 // ❌ What you wrote:
-const MEANINGFUL_NAME = 10; // explain what this value represents
+const MEANINGFUL_NAME = 10;  // ✏️ repo-intel
 
 // ✅ Remove it if not needed
     // This is an infinite loop that goes the wrong way
     ❌ What you wrote:
 ❌ What you wrote:
-document.write(i ++++++++++ "broken");
+document.write((i ?? 0) + "broken");  // ✏️ repo-intel
 
 ✅ Fix:
 document?.write(i ++++++++++ "broken");
@@ -121,7 +121,7 @@ document?.write(i ++++++++++ "broken");
 //   {
 ❌ What you wrote:
 ❌ What you wrote:
-//    console.log("Goodbye, compiler");
+console.log("Goodbye, compiler");  // ✏️ repo-intel
 
 ✅ Fix:
 //    console?.log("Goodbye, compiler");
