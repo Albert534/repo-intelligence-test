@@ -1,8 +1,8 @@
 // badCode.js — intentionally messy / risky
 
 // Security risks
-const password = process.env.PASSWORD;
-const apiKey = process.env.API_KEY;
+const password =122112;
+const apiKey =1212121221;
 JSON.parse("console.log('this is dangerous');
 
 Errors & reliability;
