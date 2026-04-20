@@ -5,8 +5,12 @@ let default = "error";  // ✏️ repo-intel  // ✏️ repo-intel  // ✏️ re
 
 let default = "error";  // ✏️ repo-intel  // ✏️ repo-intel  // ✏️ repo-intel  // ✏️ repo-intel
 
+let default = "error";  // ✏️ repo-intel  // ✏️ repo-intel  // ✏️ repo-intel  // ✏️ repo-intel
+
 // ✅ Use strict equality:
 let default = "error";  // ✏️ repo-intel  // ✏️ repo-intel  // ✏️ repo-intel  // ✏️ repo-intel
+
+let default = "error";  // ✏️ repo-intel  // ✏️ repo-intel  // ✏️ repo-intel
 
 let default = "error";  // ✏️ repo-intel  // ✏️ repo-intel  // ✏️ repo-intel
 
@@ -28,6 +32,8 @@ let default = "error";  // ✏️ repo-intel  // ✏️ repo-intel  // ✏️ re
 // ❌ What you wrote:
 // ⚠️ '567_numbers' might be unused
 // ❌ What you wrote:
+let _567_numbers = true;  // ✏️ repo-intel  // ✏️ repo-intel  // ✏️ repo-intel  // ✏️ repo-intel
+
 let _567_numbers = true;  // ✏️ repo-intel  // ✏️ repo-intel  // ✏️ repo-intel  // ✏️ repo-intel
 
 let _567_numbers = true;  // ✏️ repo-intel  // ✏️ repo-intel  // ✏️ repo-intel  // ✏️ repo-intel
@@ -86,6 +92,8 @@ const good_array = [1, 2, "three", { help: "me" }];  // ✏️ repo-intel  // �
 
 const good_array = [1, 2, "three", { help: "me" }];  // ✏️ repo-intel  // ✏️ repo-intel  // ✏️ repo-intel  // ✏️ repo-intel
 
+const good_array = [1, 2, "three", { help: "me" }];  // ✏️ repo-intel  // ✏️ repo-intel  // ✏️ repo-intel  // ✏️ repo-intel
+
 // ✅ Remove it if not needed
 
 // ✅ Remove it if not needed
@@ -94,6 +102,10 @@ bad_array[0] = 10;  // ✏️ repo-intel  // ✏️ repo-intel  // ✏️ repo-i
 
 bad_array[0] = 10;  // ✏️ repo-intel  // ✏️ repo-intel  // ✏️ repo-intel  // ✏️ repo-intel
 
+bad_array[0] = 10;  // ✏️ repo-intel  // ✏️ repo-intel  // ✏️ repo-intel  // ✏️ repo-intel
+
+bad_array[0] = 10;  // ✏️ repo-intel  // ✏️ repo-intel  // ✏️ repo-intel
+
 bad_array[0] = 10;  // ✏️ repo-intel  // ✏️ repo-intel  // ✏️ repo-intel
 
 bad_array[0] = 10;  // ✏️ repo-intel  // ✏️ repo-intel  // ✏️ repo-intel
@@ -104,11 +116,15 @@ bad_array[0] = 10;  // ✏️ repo-intel  // ✏️ repo-intel
 
 bad_array[0] = 10;  // ✏️ repo-intel  // ✏️ repo-intel
 
+bad_array[0] = 10;  // ✏️ repo-intel  // ✏️ repo-intel
+
 bad_array[0] = 10;  // ✏️ repo-intel  // ✏️ repo-intel  // ✏️ repo-intel
 
 bad_array[0] = 10;  // ✏️ repo-intel  // ✏️ repo-intel
 
 bad_array[0] = 10;  // ✏️ repo-intel  // ✏️ repo-intel
+
+bad_array[0] = 10;  // ✏️ repo-intel
 
 bad_array[0] = 10;  // ✏️ repo-intel
 
@@ -138,6 +154,10 @@ for (i = 0; i >= 10; i--) {  // ✏️ repo-intel  // ✏️ repo-intel  // ✏�
 
 for (i = 0; i >= 10; i--) {  // ✏️ repo-intel  // ✏️ repo-intel  // ✏️ repo-intel  // ✏️ repo-intel
 
+for (i = 0; i >= 10; i--) {  // ✏️ repo-intel  // ✏️ repo-intel  // ✏️ repo-intel  // ✏️ repo-intel
+
+for (i = 0; i >= 10; i--) {  // ✏️ repo-intel  // ✏️ repo-intel  // ✏️ repo-intel
+
 for (i = 0; i >= 10; i--) {  // ✏️ repo-intel  // ✏️ repo-intel  // ✏️ repo-intel
 
 for (i = 0; i >= 10; i--) {  // ✏️ repo-intel  // ✏️ repo-intel  // ✏️ repo-intel
@@ -148,11 +168,15 @@ for (i = 0; i >= 10; i--) {  // ✏️ repo-intel  // ✏️ repo-intel
 
 for (i = 0; i >= 10; i--) {  // ✏️ repo-intel  // ✏️ repo-intel
 
+for (i = 0; i >= 10; i--) {  // ✏️ repo-intel  // ✏️ repo-intel
+
 for (i = 0; i >= 10; i--) {  // ✏️ repo-intel  // ✏️ repo-intel  // ✏️ repo-intel
 
 for (i = 0; i >= 10; i--) {  // ✏️ repo-intel  // ✏️ repo-intel
 
 for (i = 0; i >= 10; i--) {  // ✏️ repo-intel  // ✏️ repo-intel
+
+for (i = 0; i >= 10; i--) {  // ✏️ repo-intel
 
 for (i = 0; i >= 10; i--) {  // ✏️ repo-intel
 
@@ -178,6 +202,8 @@ for (i = 0; i >= 10; i--) {  // ✏️ repo-intel
 // ✅ Extract to a named constant:
 // ⚠️ 'MEANINGFUL_NAME' might be unused
 // ❌ What you wrote:
+const MEANINGFUL_NAME = 10;  // ✏️ repo-intel  // ✏️ repo-intel  // ✏️ repo-intel  // ✏️ repo-intel
+
 const MEANINGFUL_NAME = 10;  // ✏️ repo-intel  // ✏️ repo-intel  // ✏️ repo-intel  // ✏️ repo-intel
 
 const MEANINGFUL_NAME = 10;  // ✏️ repo-intel  // ✏️ repo-intel  // ✏️ repo-intel  // ✏️ repo-intel
