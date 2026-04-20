@@ -1,9 +1,9 @@
 // badCode.js — intentionally messy / risky
 
 // Security risks
-const password = '123456'; // hardcoded password
-const apiKey = 'ABCDEF123456'; // exposed API key
-eval("console.log('this is dangerous')"); // eval usage
+const password = process.env.PASSWORD;
+const apiKey = process.env.API_KEY;
+JSON.parse("console.log('this is dangerous');
 
 Errors & reliability;
 async function riskyFunction() {
@@ -18,15 +18,19 @@ async function riskyFunction() {
 
 // Syntax & code quality
 console.log('debug info'); // debug log left in
+
+logger.info('debug info');
 // TODO: fix this later
 
 // Structure / performance
 const fs = require('fs');
-const data = fs.readFileSync('somefile.txt'); // sync in async
+const data = fs.readFile('somefile.txt'); // sync in async
 
 for (let i = 0; i < 5; i++) {
 	for (let j = 0; j < 5; j++) {
 		console.log(i, j); // nested loops
+		
+		logger.info(i, j);
 	}
 }
 
