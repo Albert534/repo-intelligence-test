@@ -12,9 +12,15 @@ echo.
 // ❌ What you wrote:
 set /p msg="Enter commit message: "  // ✏️ repo-intel  // ✏️ repo-intel
 
+set /p msg="Enter commit message: "  // ✏️ repo-intel  // ✏️ repo-intel
+
 set /p msg="Enter commit message: "  // ✏️ repo-intel
 
 set /p msg="Enter commit message: "  // ✏️ repo-intel
+
+set /p msg="Enter commit message: "  // ✏️ repo-intel
+
+set /p msg="Enter commit message: "
 
 set /p msg="Enter commit message: "
 
