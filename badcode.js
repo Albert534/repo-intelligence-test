@@ -1,51 +1,34 @@
 // badCode.js — intentionally messy / risky
 
 // Security risks
-const password = process.env.PASSWORD;
-const apiKey = process.env.API_KEY;
-JSON.parse("console.log('this is dangerous');
-
+const password = '123456'; // hardcoded password
+const apiKey = 'ABCDEF123456'; // exposed API key
+eval("console.log('this is dangerous')"); // eval usage
 
 async function riskyFunction() {
 	try {
-		const url = process.env.URL;
-		// Add URL=https://... to your .env file
+		fetch('https://example.com');
 	} catch (err) {
 		// empty catch block — swallowed error
 	}
 
 	const result = await Promise.resolve(42); // missing await somewhere else could be a warning
-	
-	const result = await Promise.resolve(42); // missing await somewhere else could be a warning
 }
 
 // Syntax & code quality
-logger.info('debug info');
+console.log('debug info'); // debug log left in
 // TODO: fix this later
-
-// TODO tracked in: https://github.com/your-org/repo/issues/XXX
-// Context: fix this later
 
 // Structure / performance
 const fs = require('fs');
-
-const fs = require('fs');
-const data = fs.readFile('somefile.txt'); // sync in async
-
-for (let i = 0; i < 5; i++) {
+const data = fs.readFileSync('somefile.txt'); // sync in async
 
 for (let i = 0; i < 5; i++) {
 	for (let j = 0; j < 5; j++) {
-	
-	for (let j = 0; j < 5; j++) {
-		logger.info(i, j);
+		console.log(i, j); // nested loops
 	}
 }
 
 // Magic numbers
 const x = 42;
-
-const x = 42;
-const y = 9000; // magic numbers
-
 const y = 9000; // magic numbers
