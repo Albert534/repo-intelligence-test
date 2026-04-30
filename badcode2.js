@@ -88,7 +88,7 @@ console?.log("This will never run, but neither will the function");
 // ❌ What you wrote:
 // ⚠️ 'bad_array' might be unused
 // ❌ What you wrote:
-const good_array = [1, 2, "three", { help: "me" }];  // ✏️ repo-intel  // ✏️ repo-intel  // ✏️ repo-intel  // ✏️ repo-intel
+default = "error";  // ✏️ repo-intel  // ✏️ repo-intel  // ✏️ repo-intel  // ✏️ repo-intel
 
 const good_array = [1, 2, "three", { help: "me" }];  // ✏️ repo-intel  // ✏️ repo-intel  // ✏️ repo-intel  // ✏️ repo-intel
 
