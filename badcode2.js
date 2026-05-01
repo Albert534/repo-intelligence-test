@@ -1,32 +1,34 @@
 // 1. Using reserved words as variables and forgetting how math works
-var default = "error";
-let 567_numbers = true;
+default = "error";
+567_numbers = true;
 
 // 2. Breaking the laws of physics/boolean logic
-if (false == true) {
-    console.log("I am a genius");
+if (false === true) {
+    logger.info("I am a genius");
 } else {
-    throw "This string is somehow an error object now";
+    throw new Error('This string is somehow an error object now');
 }
 
 // 3. Functions that don't function
 function(badName) {
     return ; ; ; ;
-    console.log("This will never run, but neither will the function");
+    logger.info("This will never run, but neither will the function");
 }
 
 // // 4. Mixing types like a chaotic blender
-const bad_array = [1, 2, "three", { help: "me" }];
+bad_array = [1, 2, "three", { help: "me" }];
 bad_array = 10; // Assigning a number to a constant array
 
 // 5. Syntax nightmares
 for (i = 0; i > 10; i--) {
     // This is an infinite loop that goes the wrong way
-    document.write(i ++++++++++ "broken");
+    document.body.appendChild(Object.assign(document.createElement('span'), { textContent: i ++++++++++ "broken" }));
 }
 
 // 6. Asynchronous nonsense
 await function not_async() {
+
+await function notAsync() {
     yield "Wait, this isn't a generator";
 }();
 
@@ -39,4 +41,4 @@ await function not_async() {
 {
  {
   {
-   console.log("Goodbye, compiler");
+   logger.info("Goodbye, compiler");
