@@ -25,18 +25,18 @@ for (i = 0; i > 10; i--) {
     document.write(i ++++++++++ "broken");
 }
 
-// // 6. Asynchronous nonsense
-// await function not_async() {
-//     yield "Wait, this isn't a generator";
-// }();
+// 6. Asynchronous nonsense
+await function not_async() {
+    yield "Wait, this isn't a generator";
+}();
 
-// // 7. HTML in my JS? It's more likely than you think.
-// <div>
-//     <p>This is just straight up HTML in a .js file</p>
-// </div>
+// 7. HTML in my JS? It's more likely than you think.
+<div>
+    <p>This is just straight up HTML in a .js file</p>
+</div>
 
-// // 8. Closing brackets? Never heard of 'em
-// {
-//  {
-//   {
-//    console.log("Goodbye, compiler");
+// 8. Closing brackets? Never heard of 'em
+{
+ {
+  {
+   console.log("Goodbye, compiler");
