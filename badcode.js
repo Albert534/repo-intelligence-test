@@ -1,0 +1,34 @@
+// badCode.js — intentionally messy / risky
+
+// Security risks
+const password = '123456'; // hardcoded password
+const apiKey = 'ABCDEF123456'; // exposed API key
+eval("console.log('this is dangerous')"); // eval usage
+
+async function riskyFunction() {
+	try {
+		await fetch('https://example.com');
+	} catch (err) {
+		// empty catch block — swallowed error
+	}
+
+	const result = await Promise.resolve(42); // missing await somewhere else could be a warning
+}
+
+// Syntax & code quality
+logger.info('debug info'); // debug log left in
+// TODO: fix this later
+
+// Structure / performance
+const fs = require('fs');
+const data = await fs.promises.readFile('somefile.txt', 'utf8');
+
+for (let i = 0; i < 5; i++) {
+	for (let j = 0; j < 5; j++) {
+		logger.info(i, j); // nested loops
+	}
+}
+
+// Magic numbers
+const x = 42;
+const y = 9000; // magic numbers
