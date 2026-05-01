@@ -7,7 +7,7 @@ eval("console.log('this is dangerous')"); // eval usage
 
 async function riskyFunction() {
 	try {
-		fetch('https://example.com');
+		await fetch('https://example.com');
 	} catch (err) {
 		// empty catch block — swallowed error
 	}
@@ -16,16 +16,16 @@ async function riskyFunction() {
 }
 
 // Syntax & code quality
-console.log('debug info'); // debug log left in
+logger.info('debug info'); // debug log left in
 // TODO: fix this later
 
 // Structure / performance
 const fs = require('fs');
-const data = fs.readFileSync('somefile.txt'); // sync in async
+const data = await fs.promises.readFile('somefile.txt', 'utf8');
 
 for (let i = 0; i < 5; i++) {
 	for (let j = 0; j < 5; j++) {
-		console.log(i, j); // nested loops
+		logger.info(i, j); // nested loops
 	}
 }
 
